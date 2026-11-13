@@ -6,3 +6,4 @@ version.workspace = true
 [dependencies]
 anyhow = "1"
 dockmorph-core = { path = "../core" }
+libc = "0.2"

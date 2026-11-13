@@ -1,11 +1,12 @@
 use crate::assets::icon;
+use crate::gif::Gifs;
 use crate::store::{clock, DockJob, Item, Level, Store};
 use crate::theme::Theme;
 use crate::{AddApp, CloseWindow, SyncNow};
 use dockmorph_core::{Mode, TileState};
 use gpui::{
     div, img, linear_color_stop, linear_gradient, prelude::*, px, svg, AnyElement, BoxShadow, ClickEvent, Context, Div,
-    Entity, ExternalPaths, FocusHandle, FontWeight, Hsla, PathPromptOptions, Pixels, PromptButton, PromptLevel, SharedString, Stateful,
+    ElementId, Entity, ExternalPaths, FocusHandle, FontWeight, Hsla, PathPromptOptions, Pixels, PromptButton, PromptLevel, SharedString, Stateful,
     Subscription, Window, point,
 };
 use std::path::{Path, PathBuf};
@@ -41,6 +42,7 @@ pub struct MainView {
     pending_image: Option<PathBuf>,
     /// ファイル選択パネルは開いている間もウィンドウのクリックを受け付けるので、二重に開かないようにする
     picking: bool,
+    gifs: Gifs,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -62,7 +64,15 @@ impl MainView {
         let pane = Self::default_pane(store.read(cx));
         let focus = cx.focus_handle();
         window.focus(&focus);
-        MainView { store, pane, pending_app: None, pending_image: None, picking: false, focus, _subscriptions: subscriptions }
+        MainView { store, pane, pending_app: None, pending_image: None, picking: false, gifs: Gifs::new(), focus, _subscriptions: subscriptions }
+    }
+
+    /// 登録画像のプレビュー。GIF は gpui に任せず自前でコマを選ぶ(gif.rs)
+    fn picture(&self, path: &Path, id: impl Into<ElementId>, size: f32, radius: f32, cx: &mut Context<Self>) -> AnyElement {
+        match self.gifs.source(path, |v: &mut MainView| &v.gifs, cx) {
+            Some(src) => img(src).id(id).size(px(size)).flex_none().rounded(px(radius)).into_any_element(),
+            None => div().size(px(size)).flex_none().into_any_element(),
+        }
     }
 
     fn default_pane(store: &Store) -> Pane {
@@ -350,9 +360,9 @@ fn level_style(level: Level, t: &Theme) -> (&'static str, Hsla) {
 
 impl MainView {
     fn sidebar(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let store = self.store.read(cx);
-        let rows: Vec<_> = store
-            .items
+        // 行の描画で cx を借りる(GIF の読み込み)ので、一覧は先に写しておく
+        let items = self.store.read(cx).items.clone();
+        let rows: Vec<_> = items
             .iter()
             .enumerate()
             .map(|(i, item)| {
@@ -371,7 +381,7 @@ impl MainView {
                     .cursor_pointer()
                     .when(selected, |d| d.bg(selected_bg))
                     .when(!selected, |d| d.hover(move |s| s.bg(hover_bg)))
-                    .child(img(item.entry.icon_path.clone()).size(px(28.)).flex_none().rounded(px(7.)))
+                    .child(self.picture(&item.entry.icon_path, ("row-icon", i), 28., 7., cx))
                     .child(
                         div()
                             .flex()
@@ -393,6 +403,7 @@ impl MainView {
             })
             .collect();
 
+        let store = self.store.read(cx);
         let issues = store.issue_count();
         let (dot, summary) = if store.items.is_empty() {
             (t.text3, "まだ登録がありません".to_string())
@@ -540,7 +551,7 @@ impl MainView {
                             .rounded(px(22.))
                             .items_center()
                             .justify_center()
-                            .child(img(item.entry.icon_path.clone()).size(px(92.)))
+                            .child(self.picture(&item.entry.icon_path, "detail-icon", 92., 0., cx))
                             .drag_over::<ExternalPaths>(move |s, _, _, _| s.border_color(accent).bg(Theme::tint(accent, 0.08)))
                             .when(idle, |d| {
                                 d.cursor_pointer()
@@ -679,7 +690,7 @@ impl MainView {
                 tile("sync", if on { t.green } else { t.accent }, 28.),
                 "直接開かれたら自動でまとめ直す",
                 if on {
-                    "本物が直接開かれたら、起動した直後に自動で終了して、起動用アプリから開き直します。リンクやファイルから開いた場合、その内容は引き継がれません(DockMorph の常駐中だけ働きます)"
+                    "本物が直接開かれたら、起動した直後に自動で終了して、起動用アプリから開き直します。このアプリ用のリンク(会議リンクなど)は起動用アプリが受け取るので、そのまま 1 つのタイルで開きます。ファイルから開いた場合は、そのファイルは引き継がれません(DockMorph の常駐中だけ働きます)"
                 } else {
                     "オフです。本物が直接開かれると、動かないタイルが出ます。「まとめ直す」で戻せます"
                 },
@@ -762,7 +773,7 @@ impl MainView {
         };
         let filled = path.is_some();
         let preview: AnyElement = match (&path, for_app) {
-            (Some(p), false) => img(p.clone()).size(px(72.)).rounded(px(16.)).into_any_element(),
+            (Some(p), false) => self.picture(p, "pending-icon", 72., 16., cx),
             _ => tile(empty_icon, tint, 56.).into_any_element(),
         };
         let accent = t.accent;
@@ -917,7 +928,7 @@ impl Render for MainView {
         };
         let accent = t.accent;
 
-        div()
+        let root = div()
             .track_focus(&self.focus)
             .key_context("MainView")
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| window.remove_window()))
@@ -967,7 +978,9 @@ impl Render for MainView {
                     .border_color(gpui::transparent_black())
                     .drag_over::<ExternalPaths>(move |s, _, _, _| s.border_color(accent).bg(Theme::tint(accent, 0.06))),
             )
-            .children(self.banner(&t, cx))
+            .children(self.banner(&t, cx));
+        self.gifs.finish_frame(window, cx);
+        root
     }
 }
 

@@ -45,6 +45,14 @@ func execTarget() {
 execTarget()
 
 final class Delegate: NSObject, NSApplicationDelegate {
+    // DockMorph が URL スキーム・書類の既定をこの起動用アプリにしているので、本物へそのまま渡す。
+    // 起動時に渡されたものは applicationDidFinishLaunching より前に届く
+    var pending: [URL] = []
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        pending += urls
+    }
+
     func applicationDidFinishLaunching(_ n: Notification) {
         // Dock は一度も起動されていないアプリのプラグインを読み込まない(実測)。DockMorph が登録のためだけに起動する
         if CommandLine.arguments.contains("--dm-register") {
@@ -57,7 +65,7 @@ final class Delegate: NSObject, NSApplicationDelegate {
            let found = NSWorkspace.shared.urlForApplication(withBundleIdentifier: targetBundleID) {
             url = found
         }
-        NSWorkspace.shared.openApplication(at: url, configuration: .init()) { _, error in
+        let done: (NSRunningApplication?, Error?) -> Void = { _, error in
             DispatchQueue.main.async {
                 if let error {
                     let alert = NSAlert()
@@ -68,6 +76,11 @@ final class Delegate: NSObject, NSApplicationDelegate {
                 }
                 NSApp.terminate(nil)
             }
+        }
+        if pending.isEmpty {
+            NSWorkspace.shared.openApplication(at: url, configuration: .init(), completionHandler: done)
+        } else {
+            NSWorkspace.shared.open(pending, withApplicationAt: url, configuration: .init(), completionHandler: done)
         }
     }
 }

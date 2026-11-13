@@ -3,7 +3,8 @@ use objc2::rc::Retained;
 use objc2::runtime::Bool;
 use objc2::AllocAnyThread;
 use objc2_app_kit::{NSCompositingOperation, NSImage, NSRunningApplication, NSWorkspace, NSWorkspaceIconCreationOptions};
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use block2::RcBlock;
+use objc2_foundation::{NSError, NSPoint, NSRect, NSSize, NSString, NSURL};
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::fs;
@@ -11,6 +12,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+mod dock_ax;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +110,48 @@ pub struct AddResult {
 
 const LSREGISTER: &str =
     "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+
+#[link(name = "CoreServices", kind = "framework")]
+extern "C" {
+    fn LSCopyDefaultHandlerForURLScheme(scheme: *const NSString) -> *mut NSString;
+}
+
+/// 起動用アプリが本物の代わりに受け持つ URL スキーム。リンクから開かれても起動用アプリを通るので、タイルが分かれず、
+/// exec した本物に URL もそのまま届く(実測)。
+/// 書類の種類(UTI)は受け持たない。既定を切り替えると macOS が「すべて〜で開きますか?」の確認を出すことがある(Scotch の .exe で実測)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Scheme(String);
+
+impl Scheme {
+    fn default_handler(&self) -> Option<String> {
+        let ptr = unsafe { LSCopyDefaultHandlerForURLScheme(&*NSString::from_str(&self.0)) };
+        // Copy 規則で +1 の参照が返る
+        unsafe { Retained::from_raw(ptr) }.map(|s| s.to_string())
+    }
+
+    /// bundle ID で指定する旧 API(LSSetDefault…)は、成功を返しながら何も変えないことがあった(VS Code の json で実測)。
+    /// アプリの場所で指定する NSWorkspace の API を使う
+    fn set_default_handler(&self, app: &Path) -> Result<()> {
+        let ws = NSWorkspace::sharedWorkspace();
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&app.to_string_lossy()));
+        let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+        let done = RcBlock::new(move |err: *mut NSError| {
+            let message = unsafe { err.as_ref() }.map(|e| e.localizedDescription().to_string());
+            // 受け手が時間切れで先に戻っていたら、届け先がないだけ
+            let _ = tx.send(message);
+        });
+        ws.setDefaultApplicationAtURL_toOpenURLsWithScheme_completionHandler(&url, &NSString::from_str(&self.0), Some(&done));
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(None) => Ok(()),
+            Ok(Some(e)) => bail!("{}: の既定のアプリを切り替えられません ({}): {e}", self.0, app.display()),
+            Err(_) => bail!("{}: の既定のアプリの切り替えが終わりません ({})", self.0, app.display()),
+        }
+    }
+
+    fn handled_by(&self, bundle_id: &str) -> bool {
+        self.default_handler().is_some_and(|h| h.eq_ignore_ascii_case(bundle_id))
+    }
+}
 
 #[derive(Clone)]
 pub struct DockMorph {
@@ -678,13 +723,15 @@ impl DockMorph {
         }
     }
 
-    pub fn remove(&self, bundle_id: &str) -> Result<()> {
+    /// Dock を再起動して動くタイルを外したときは、その理由を返す
+    pub fn remove(&self, bundle_id: &str) -> Result<Option<String>> {
         let _lock = self.lock()?;
         let mut entries = self.load_entries()?;
         let i = entries.iter().position(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("未登録です: {bundle_id}"))?;
         let entry = entries[i].clone();
+        let mut warning = None;
         if let Some(anim) = &entry.animation {
-            self.teardown_animation(&entry, anim)?;
+            warning = self.teardown_animation(&entry, anim)?;
             entries[i].animation = None;
             // 途中で失敗しても、Dock から外したことは登録に残す
             self.save_entries(&entries)?;
@@ -710,7 +757,8 @@ impl DockMorph {
             fs::remove_file(&entry.icon_path)?;
         }
         entries.remove(i);
-        self.save_entries(&entries)
+        self.save_entries(&entries)?;
+        Ok(warning)
     }
 
     pub fn sync(&self) -> Result<Vec<SyncResult>> {
@@ -847,9 +895,10 @@ impl DockMorph {
 
     /// 起動用アプリの Info.plist・タイルの画像・署名・静止画のアイコンを、登録の今の状態に合わせて書き直す
     fn refresh_launcher(&self, entry: &Entry, launcher: &Path, direct: bool) -> Result<()> {
+        let id = Self::launcher_id(&entry.bundle_id);
         let mut d = plist::Dictionary::new();
         let s = |v: &str| plist::Value::String(v.to_string());
-        d.insert("CFBundleIdentifier".into(), s(&Self::launcher_id(&entry.bundle_id)));
+        d.insert("CFBundleIdentifier".into(), s(&id));
         d.insert("CFBundleName".into(), s(&entry.display_name()));
         d.insert("CFBundleExecutable".into(), s("DMLauncher"));
         d.insert("CFBundlePackageType".into(), s("APPL"));
@@ -861,6 +910,23 @@ impl DockMorph {
         d.insert("DMTargetApp".into(), s(&self.target_path(entry)?.to_string_lossy()));
         d.insert("DMTargetBundleID".into(), s(&entry.bundle_id));
         d.insert("DMDirect".into(), plist::Value::Boolean(direct));
+        // 本物を別に開く方式では、受け持ってもタイルは分かれるので受け持たない
+        let schemes: Vec<Scheme> = if direct {
+            Self::declared_schemes(&entry.source_path.join("Contents/Info.plist"))?
+                .into_iter()
+                // ほかのアプリが既定のものは奪わない。作り直し・入れ替えのときは、すでに受け持っているものも続けて持つ
+                .filter(|c| c.handled_by(&entry.bundle_id) || c.handled_by(&id))
+                .collect()
+        } else {
+            vec![]
+        };
+        if !schemes.is_empty() {
+            let mut u = plist::Dictionary::new();
+            u.insert("CFBundleURLName".into(), s(&id));
+            u.insert("CFBundleTypeRole".into(), s("Editor"));
+            u.insert("CFBundleURLSchemes".into(), plist::Value::Array(schemes.iter().map(|c| c.0.as_str().into()).collect()));
+            d.insert("CFBundleURLTypes".into(), plist::Value::Array(vec![u.into()]));
+        }
         plist::Value::Dictionary(d).to_file_xml(launcher.join("Contents/Info.plist"))?;
         // Dock 側のプラグインが周回ごとに読み直すので、書きかけを読ませないよう rename で置き換える
         let resources = launcher.join("Contents/Resources");
@@ -876,7 +942,44 @@ impl DockMorph {
         Self::run(Command::new("/usr/bin/codesign").args(["--force", "-s", "-"]).arg(launcher))?;
         // プラグインが読み込まれるまでの間や、読み込まれなかったときに出る静止画
         Self::apply_icon(&entry.icon_path, launcher)?;
-        Self::run(Command::new(LSREGISTER).arg("-f").arg(launcher))
+        Self::run(Command::new(LSREGISTER).arg("-f").arg(launcher))?;
+        // 宣言を登録してからでないと、LaunchServices は起動用アプリを既定にできない
+        for c in &schemes {
+            c.set_default_handler(launcher)?;
+        }
+        Ok(())
+    }
+
+    /// Info.plist が宣言している URL スキーム。http(s) は既定のブラウザの変更になり、macOS が確認を出すので除く
+    fn declared_schemes(info_plist: &Path) -> Result<Vec<Scheme>> {
+        let plist = match plist::Value::from_file(info_plist) {
+            Ok(p) => p,
+            Err(e) if e.as_io().is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) => return Ok(vec![]),
+            Err(e) => return Err(e).with_context(|| format!("読めません: {}", info_plist.display())),
+        };
+        let mut schemes = vec![];
+        let types = plist.as_dictionary().and_then(|d| d.get("CFBundleURLTypes")).and_then(|v| v.as_array());
+        for t in types.into_iter().flatten().filter_map(|t| t.as_dictionary()?.get("CFBundleURLSchemes")?.as_array()).flatten() {
+            let Some(s) = t.as_string().map(str::to_lowercase) else { continue };
+            let c = Scheme(s.clone());
+            if s != "http" && s != "https" && !schemes.contains(&c) {
+                schemes.push(c);
+            }
+        }
+        Ok(schemes)
+    }
+
+    /// 起動用アプリが受け持っていた URL スキームの既定を本物に返す。起動用アプリを消す前に呼ぶ
+    fn release_schemes(entry: &Entry, launcher: &Path) -> Result<()> {
+        let id = Self::launcher_id(&entry.bundle_id);
+        for c in Self::declared_schemes(&launcher.join("Contents/Info.plist"))? {
+            // 切り替えた直後は問い合わせに前の既定が返ることがある(実測)ので、本物が既定に見えても戻しておく。
+            // ユーザーがその後ほかのアプリを既定にしたものだけは触らない
+            if c.handled_by(&id) || c.handled_by(&entry.bundle_id) {
+                c.set_default_handler(&entry.source_path)?;
+            }
+        }
+        Ok(())
     }
 
     fn read_dock() -> Result<(Vec<u8>, plist::Value)> {
@@ -1029,14 +1132,56 @@ impl DockMorph {
         Ok(replaced)
     }
 
-    fn unpin_launcher(&self, entry: &Entry, anim: &Animation) -> Result<()> {
+    /// 本物を元の位置に戻す必要がなければ、Dock のタイルのメニューで外す(Dock を再起動しない)。
+    /// メニューで外せなかったときは Dock の設定を書き換えて再起動し、その理由を返す
+    fn unpin_launcher(&self, entry: &Entry, anim: &Animation) -> Result<Option<String>> {
         let launcher_url = Self::file_url(&anim.launcher_path)?;
+        let source_url = Self::file_url(&entry.source_path)?;
         let id = Self::launcher_id(&entry.bundle_id);
+        let (_, mut dock) = Self::read_dock()?;
+        let apps = Self::persistent_apps(&mut dock)?;
+        let pinned = apps.iter().any(|t| Self::tile_matches(t, &id, &launcher_url));
+        // メニューではタイルを外せても足せないので、本物を戻すときは書き換えと再起動が要る
+        let restore_real = anim.replaced_pin && !apps.iter().any(|t| Self::tile_matches(t, &entry.bundle_id, &source_url));
+        if !pinned && !restore_real {
+            return Ok(None);
+        }
+        let mut fallback = None;
+        if !restore_real {
+            match self.unpin_by_menu(anim, &id, &launcher_url) {
+                Ok(()) => return Ok(None),
+                Err(e) => {
+                    let hint = if dock_ax::trusted() {
+                        String::new()
+                    } else {
+                        "。システム設定 › プライバシーとセキュリティ › アクセシビリティで DockMorph を許可すると、再起動せずに外せます".into()
+                    };
+                    fallback = Some(format!("Dock のメニューから外せなかったので、Dock を再起動して外しました({e:#}){hint}"));
+                }
+            }
+        }
         self.edit_dock(
             |dm| dm.unpin_launcher_once(entry, anim).map(Some),
             |apps| !apps.iter().any(|t| Self::tile_matches(t, &id, &launcher_url)),
         )?;
-        Ok(())
+        Ok(fallback)
+    }
+
+    fn unpin_by_menu(&self, anim: &Animation, id: &str, launcher_url: &str) -> Result<()> {
+        let pid = Self::dock_pid().ok_or_else(|| anyhow!("Dock が起動していません"))?;
+        if !dock_ax::unpin(pid, &anim.launcher_path)? {
+            bail!("Dock に起動用アプリのタイルが見つかりません");
+        }
+        // Dock は設定ファイルへ数秒遅れて書く(実測で約 4 秒)。書かれる前に続きの処理が設定を読むと古い並びを見る
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(10) {
+            let (_, mut dock) = Self::read_dock()?;
+            if !Self::persistent_apps(&mut dock)?.iter().any(|t| Self::tile_matches(t, id, launcher_url)) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        bail!("メニューで外しましたが、Dock の設定に反映されません")
     }
 
     fn unpin_launcher_once(&self, entry: &Entry, anim: &Animation) -> Result<()> {
@@ -1058,14 +1203,15 @@ impl DockMorph {
         self.write_dock(&original, &dock)
     }
 
-    fn teardown_animation(&self, entry: &Entry, anim: &Animation) -> Result<()> {
-        self.unpin_launcher(entry, anim)?;
+    fn teardown_animation(&self, entry: &Entry, anim: &Animation) -> Result<Option<String>> {
+        let warning = self.unpin_launcher(entry, anim)?;
         if anim.launcher_path.exists() {
+            Self::release_schemes(entry, &anim.launcher_path)?;
             Self::unregister(&anim.launcher_path);
             fs::remove_dir_all(&anim.launcher_path)
                 .with_context(|| format!("起動用アプリを消せません: {}", anim.launcher_path.display()))?;
         }
-        Ok(())
+        Ok(warning)
     }
 
     /// template は DockMorph.app に同梱の Launcher.app(プラグイン入りの雛形)
@@ -1110,8 +1256,10 @@ impl DockMorph {
             let anim = Animation { launcher_path: launcher.clone(), replaced_pin, direct, created, auto_rejoin: true };
             entries[i].animation = Some(anim.clone());
             if let Err(e) = self.save_entries(&entries) {
-                if let Err(u) = self.unpin_launcher(&entries[i], &anim) {
-                    eprintln!("Dock を元に戻せません: {u:#}");
+                match self.unpin_launcher(&entries[i], &anim) {
+                    Ok(Some(w)) => eprintln!("{w}"),
+                    Ok(None) => {}
+                    Err(u) => eprintln!("Dock を元に戻せません: {u:#}"),
                 }
                 return Err(e);
             }
@@ -1119,6 +1267,9 @@ impl DockMorph {
         })();
         if let Err(e) = result {
             if launcher.exists() {
+                if let Err(r) = Self::release_schemes(&entries[i], &launcher) {
+                    eprintln!("既定のアプリを本物に戻せません: {r:#}");
+                }
                 Self::unregister(&launcher);
                 if let Err(rm) = fs::remove_dir_all(&launcher) {
                     eprintln!("後片付けに失敗 ({}): {rm}", launcher.display());
@@ -1131,7 +1282,7 @@ impl DockMorph {
 
     /// 本人以外のアクセスを macOS が止めるデータ(com.apple.macl 付き)を持つアプリか。exec した起動用アプリは
     /// 中身が本物でも本人と認められず、Firefox はプロファイルを読めなくなった(実測)。データの置き場所は
-    /// アプリ次第なので、名前の一致する Application Support と Team ID の Group Containers だけを見る推定
+    /// アプリ次第なので、名前の一致する Application Support と entitlement の Group Containers だけを見る推定
     fn protected_data(&self, entry: &Entry) -> Result<Option<PathBuf>> {
         let library = PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME が未設定です"))?).join("Library");
         let plist = plist::Value::from_file(entry.source_path.join("Contents/Info.plist"))
@@ -1143,26 +1294,23 @@ impl DockMorph {
             .collect();
         names.push(entry.bundle_id.to_lowercase());
         names.push(entry.display_name().to_lowercase());
-        let team = Self::team_id(&entry.source_path);
         let mut candidates = vec![library.join("Containers").join(&entry.bundle_id)];
-        for (dir, by_team) in [(library.join("Application Support"), false), (library.join("Group Containers"), true)] {
-            let items = match fs::read_dir(&dir) {
-                Ok(i) => i,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e).with_context(|| format!("読めません: {}", dir.display())),
-            };
-            for item in items {
-                let path = item?.path();
-                let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-                let hit = if by_team {
-                    team.as_ref().is_some_and(|t| name.starts_with(&format!("{}.", t.to_lowercase())))
-                } else {
-                    names.contains(&name)
-                };
-                if hit {
-                    candidates.push(path);
+        // 同じ開発元の別製品のグループ(Microsoft の oneauth など)まで拾うと、使ってもいないデータで誤判定する(VS Code で実測)。
+        // アプリが entitlement で名乗ったグループだけを見る
+        candidates.extend(Self::app_groups(&entry.source_path)?.into_iter().map(|g| library.join("Group Containers").join(g)));
+        let support = library.join("Application Support");
+        match fs::read_dir(&support) {
+            Ok(items) => {
+                for item in items {
+                    let path = item?.path();
+                    let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+                    if names.contains(&name) {
+                        candidates.push(path);
+                    }
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("読めません: {}", support.display())),
         }
         Ok(candidates.into_iter().find(|p| Self::has_xattr(p, c"com.apple.macl")))
     }
@@ -1172,24 +1320,37 @@ impl DockMorph {
         unsafe { libc::getxattr(p.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0, 0, 0) >= 0 }
     }
 
-    /// ad-hoc 署名なら None
-    fn team_id(app: &Path) -> Option<String> {
-        let output = Command::new("/usr/bin/codesign").arg("-dv").arg(app).output().ok()?;
-        String::from_utf8_lossy(&output.stderr)
-            .lines()
-            .find_map(|l| l.strip_prefix("TeamIdentifier="))
-            .filter(|t| *t != "not set")
-            .map(str::to_string)
+    /// 署名の entitlement にある com.apple.security.application-groups
+    fn app_groups(app: &Path) -> Result<Vec<String>> {
+        let output = Command::new("/usr/bin/codesign")
+            .args(["-d", "--entitlements", "-", "--xml"])
+            .arg(app)
+            .output()
+            .context("codesign を実行できません")?;
+        // 未署名・entitlement なしでは何も出ない(グループも使えない)
+        if !output.status.success() || output.stdout.is_empty() {
+            return Ok(vec![]);
+        }
+        let ent = plist::Value::from_reader_xml(output.stdout.as_slice())
+            .with_context(|| format!("entitlement を読めません: {}", app.display()))?;
+        Ok(ent
+            .as_dictionary()
+            .and_then(|d| d.get("com.apple.security.application-groups"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_string().map(str::to_string)).collect())
+            .unwrap_or_default())
     }
 
-    pub fn disable_animation(&self, bundle_id: &str) -> Result<()> {
+    /// Dock を再起動して外したときは、その理由を返す
+    pub fn disable_animation(&self, bundle_id: &str) -> Result<Option<String>> {
         let _lock = self.lock()?;
         let mut entries = self.load_entries()?;
         let i = entries.iter().position(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("未登録です: {bundle_id}"))?;
         let Some(anim) = entries[i].animation.clone() else { bail!("オンになっていません: {}", entries[i].display_name()) };
-        self.teardown_animation(&entries[i], &anim)?;
+        let warning = self.teardown_animation(&entries[i], &anim)?;
         entries[i].animation = None;
-        self.save_entries(&entries)
+        self.save_entries(&entries)?;
+        Ok(warning)
     }
 
     /// 元アプリにアイコンが付いているか(clone なら複製に付いているか)

@@ -1,4 +1,5 @@
 mod assets;
+mod gif;
 mod login;
 mod menubar;
 mod store;

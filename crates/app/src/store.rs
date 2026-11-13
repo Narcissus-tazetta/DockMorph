@@ -363,7 +363,7 @@ impl Store {
                     let t = template.ok_or_else(|| anyhow::anyhow!("DockMorph の場所が分かりません"))?;
                     dm.enable_animation(&id, &t, pin).map(|r| r.fallback_reason)
                 } else {
-                    dm.disable_animation(&id).map(|()| None)
+                    dm.disable_animation(&id)
                 }
             },
             move |this, result, cx| match (result, on) {
@@ -380,7 +380,8 @@ impl Store {
                     cx,
                 ),
                 (Ok(Some(why)), true) => this.notify(Level::Warn, format!("{name} を Dock で動かしています(タイルが 2 つ並ぶ方式)"), Some(why), cx),
-                (Ok(_), false) => this.notify(Level::Success, format!("{name} の動くタイルを外しました"), None, cx),
+                (Ok(None), false) => this.notify(Level::Success, format!("{name} の動くタイルを外しました"), None, cx),
+                (Ok(Some(why)), false) => this.notify(Level::Warn, format!("{name} の動くタイルを外しました(Dock を再起動しました)"), Some(why), cx),
                 (Err(e), true) => this.notify(Level::Error, format!("{name} を Dock で動かせません"), Some(format!("{e:#}")), cx),
                 (Err(e), false) => this.notify(Level::Error, format!("{name} の動くタイルを外せません"), Some(format!("{e:#}")), cx),
             },
@@ -413,8 +414,9 @@ impl Store {
     pub fn remove(&mut self, bundle_id: &str, cx: &mut Context<Self>) {
         let name = self.item(bundle_id).map(|i| i.name.to_string()).unwrap_or_else(|| bundle_id.to_string());
         let id = bundle_id.to_string();
-        let done = move |this: &mut Self, result: anyhow::Result<()>, cx: &mut Context<Self>| match result {
-            Ok(()) => this.notify(Level::Success, format!("{name} を元のアイコンに戻しました"), None, cx),
+        let done = move |this: &mut Self, result: anyhow::Result<Option<String>>, cx: &mut Context<Self>| match result {
+            Ok(None) => this.notify(Level::Success, format!("{name} を元のアイコンに戻しました"), None, cx),
+            Ok(Some(why)) => this.notify(Level::Warn, format!("{name} を元のアイコンに戻しました(Dock を再起動しました)"), Some(why), cx),
             Err(e) => this.notify(Level::Error, format!("{name} を元に戻せません"), Some(format!("{e:#}")), cx),
         };
         if self.item(bundle_id).is_some_and(|i| i.entry.animation.is_some()) {

@@ -22,6 +22,9 @@ const USAGE: &str = "usage:
   dockmorph remove <bundle-id>      アイコンを戻し、登録を削除";
 
 fn main() -> Result<()> {
+    // Rust は SIGPIPE を無視するので、`list | head` で読み手が先に閉じると println! が panic する。
+    // ほかの CLI と同じく、黙って終了させる
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dm = DockMorph::new()?;
     match args.first().map(String::as_str) {
@@ -91,7 +94,9 @@ fn main() -> Result<()> {
             }
         }
         Some("animate") if args.len() == 3 && args[2] == "off" => {
-            dm.disable_animation(&args[1])?;
+            if let Some(w) = dm.disable_animation(&args[1])? {
+                eprintln!("warning: {w}");
+            }
             println!("stopped {}", args[1]);
         }
         Some("rejoin") if args.len() == 2 => dm.rejoin(&args[1])?,
@@ -102,7 +107,11 @@ fn main() -> Result<()> {
         }
         Some("refresh-dock") if args.len() == 1 => dm.refresh_dock()?,
         Some("launch") if args.len() == 2 => dm.launch(&args[1])?,
-        Some("remove") if args.len() == 2 => dm.remove(&args[1])?,
+        Some("remove") if args.len() == 2 => {
+            if let Some(w) = dm.remove(&args[1])? {
+                eprintln!("warning: {w}");
+            }
+        }
         _ => bail!("{USAGE}"),
     }
     Ok(())

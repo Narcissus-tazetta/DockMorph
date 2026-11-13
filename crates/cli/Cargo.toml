@@ -1,0 +1,8 @@
+[package]
+name = "dockmorph"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = "1"
+dockmorph-core = { path = "../core" }

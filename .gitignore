@@ -1,2 +1,5 @@
 /target
-target/bundle
+.DS_Store
+.claude/
+.env
+*.swp

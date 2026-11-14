@@ -58,6 +58,7 @@ pub struct Store {
     pub last_sync: Option<SystemTime>,
     issues: HashMap<String, SharedString>,
     banner_seq: u64,
+    pub ax_trusted: bool,
     /// Dock を書き換え中のアプリと、いまの手順。終わるまで他の操作を受け付けない
     pub busy: Option<(String, SharedString)>,
     /// busy の進み具合をどの行に出すか
@@ -77,7 +78,7 @@ impl Store {
     /// 同期の定期実行はウィンドウではなくこのエンティティに持たせる。ウィンドウを閉じてメニューバーに常駐している間も止めないため
     pub fn new(dm: DockMorph, cx: &mut Context<Self>) -> Self {
         let mut store =
-            Store { dm, items: vec![], banner: None, last_sync: None, issues: HashMap::new(), banner_seq: 0, busy: None, busy_job: DockJob::Animation, auto_rejoined: HashMap::new() };
+            Store { dm, items: vec![], banner: None, last_sync: None, issues: HashMap::new(), banner_seq: 0, ax_trusted: DockMorph::accessibility_trusted(), busy: None, busy_job: DockJob::Animation, auto_rejoined: HashMap::new() };
         store.upgrade_launchers(cx);
         store.sync(false, cx);
         cx.spawn(async move |this, cx| loop {
@@ -103,7 +104,8 @@ impl Store {
             return;
         }
         // タイルの状態(起動中か、分かれたか)は、30 秒ごとの同期を待たずに画面へ出す
-        let mut changed = false;
+        let mut changed = self.ax_trusted != DockMorph::accessibility_trusted();
+        self.ax_trusted = DockMorph::accessibility_trusted();
         for item in &mut self.items {
             let tile = self.dm.tile_state(&item.entry);
             changed |= tile != item.tile;
@@ -131,6 +133,11 @@ impl Store {
             _ => {}
         }
         self.rejoin(&id, cx);
+    }
+
+    pub fn request_accessibility(&mut self, cx: &mut Context<Self>) {
+        self.ax_trusted = DockMorph::request_accessibility();
+        cx.notify();
     }
 
     pub fn set_auto_rejoin(&mut self, bundle_id: &str, on: bool, cx: &mut Context<Self>) {

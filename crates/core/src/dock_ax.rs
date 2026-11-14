@@ -3,8 +3,8 @@
 //! 呼び出し元のプロセスにアクセシビリティの許可が要る。
 
 use anyhow::{anyhow, bail, Context, Result};
-use objc2_application_services::{AXError, AXIsProcessTrusted, AXUIElement};
-use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType, CFURL};
+use objc2_application_services::{kAXTrustedCheckOptionPrompt, AXError, AXIsProcessTrusted, AXIsProcessTrustedWithOptions, AXUIElement};
+use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType, CFURL};
 use std::collections::HashSet;
 use std::path::Path;
 use std::ptr::NonNull;
@@ -14,6 +14,13 @@ const DOCK_APP: &str = "/System/Library/CoreServices/Dock.app";
 
 pub fn trusted() -> bool {
     unsafe { AXIsProcessTrusted() }
+}
+
+/// システムの許可ダイアログを出す(未許可のとき)。この呼び出しで初めてアプリがアクセシビリティの一覧に載る
+pub fn request_trust() -> bool {
+    let key: &CFString = unsafe { kAXTrustedCheckOptionPrompt };
+    let opts = CFDictionary::<CFString, CFBoolean>::from_slices(&[key], &[CFBoolean::new(true)]);
+    unsafe { AXIsProcessTrustedWithOptions(Some(opts.as_opaque())) }
 }
 
 /// app を指すタイルのピン留めを外す。そのタイルが Dock に無ければ Ok(false)

@@ -701,6 +701,18 @@ impl MainView {
             });
             with_button(row, b)
         });
+        let ax_row = (animated && !self.store.read(cx).ax_trusted).then(|| {
+            let row = setting_row(
+                tile("warning", t.orange, 28.),
+                "アクセシビリティの許可がありません",
+                "許可すると、オフにしたときに Dock を再起動せずに起動用アプリのタイルを外せます。許可がないと Dock を再起動するので、起動中のほかの動くタイルが分かれることがあります",
+                t,
+            );
+            let b = button("ax", "許可する", None, Kind::Normal, idle, t).when(idle, |d| {
+                d.on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.store.update(cx, |s, cx| s.request_accessibility(cx))))
+            });
+            with_button(row, b)
+        });
         let rejoin_id = id.clone();
         let split_row = split.then(|| {
             let row = setting_row(
@@ -723,6 +735,7 @@ impl MainView {
                 Some(anim_row),
                 auto_row,
                 split_row,
+                ax_row,
                 Some(setting_row(
                     tile("sync", t.accent, 28.),
                     "アップデート後も自動で付け直す",

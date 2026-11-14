@@ -320,6 +320,19 @@ impl DockMorph {
     /// Dock は起動したアプリを、起動した時点のバンドル(起動用アプリ)のタイルに結び付ける。exec 後のプロセスは
     /// LaunchServices 上は本物なので、Dock が再起動すると本物のタイルとして並べ直され、動くタイルから外れる(実測)。
     /// だから「今の起動用アプリから開かれた」かつ「今の Dock より後に起動した」ときだけ 1 つにまとまっている
+    pub fn accessibility_trusted() -> bool {
+        dock_ax::trusted()
+    }
+
+    /// 許可ダイアログを出し、システム設定のアクセシビリティを開く
+    pub fn request_accessibility() -> bool {
+        let trusted = dock_ax::request_trust();
+        if !trusted {
+            let _ = std::process::Command::new("/usr/bin/open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility").status();
+        }
+        trusted
+    }
+
     pub fn tile_state(&self, entry: &Entry) -> Option<TileState> {
         let anim = entry.animation.as_ref()?;
         let target = self.target_path(entry).ok()?;

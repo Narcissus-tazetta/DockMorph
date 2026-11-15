@@ -50,5 +50,7 @@ PLIST
 codesign --force -s - "$plug"
 # 作成済みの起動用アプリを入れ替えるかどうかを、DockMorph がこの印で判断する
 cat "$tpl/Contents/MacOS/DMLauncher" "$plug/Contents/MacOS/DMAnimTile" | shasum -a 256 | cut -d' ' -f1 > "$tpl/Contents/Resources/dm-template"
-codesign --force -s - "$app"
+# ad-hoc 署名はビルドのたびに別のアプリ扱いになり、アクセシビリティの許可が外れる。証明書で署名すれば残る
+identity=${DOCKMORPH_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk '/Apple Development/ { print $2; exit }')}
+codesign --force -s "${identity:--}" "$app"
 echo "$app"

@@ -26,18 +26,22 @@ func isRunning(executable: String) -> Bool {
     return false
 }
 
+/// DockMorph が Dock のタイルのメニューで「Dock に残す」を押す間、起動中のタイルを出したままにする
+let hold = CommandLine.arguments.contains("--dm-hold")
+
 func execTarget() {
-    guard direct, !CommandLine.arguments.contains("--dm-register"),
+    guard direct, !hold, !CommandLine.arguments.contains("--dm-register"),
           let exe = Bundle(path: targetPath)?.executableURL?.resolvingSymlinksInPath().path,
           !isRunning(executable: exe) else { return }
     // exec 後のプロセスは外から見ると本物と区別が付かない。DockMorph が「起動用アプリから開かれた(タイルが 1 つ)」と
-    // 判定できるよう、環境変数に印を残す
-    setenv("DOCKMORPH_LAUNCHER", Bundle.main.bundlePath, 1)
+    // 判定できるよう、環境変数に印を残す。環境変数は、アプリが自分を起動し直したとき(更新後の再起動など)の
+    // 新しいプロセスにも引き継がれる。そちらは本物のタイルに出るので、exec しても変わらない pid を値にして見分ける
+    setenv("DOCKMORPH_LAUNCHER_PID", String(getpid()), 1)
     var args: [UnsafeMutablePointer<CChar>?] = [strdup(exe)]
     args += CommandLine.arguments.dropFirst().map { strdup($0) }
     args.append(nil)
     execv(exe, args)
-    unsetenv("DOCKMORPH_LAUNCHER")
+    unsetenv("DOCKMORPH_LAUNCHER_PID")
     // 戻ってきたら失敗。本物を開く通常の経路に回す
     NSLog("DockMorph: exec に失敗 (\(String(cString: strerror(errno)))): \(exe)")
 }
@@ -57,6 +61,11 @@ final class Delegate: NSObject, NSApplicationDelegate {
         // Dock は一度も起動されていないアプリのプラグインを読み込まない(実測)。DockMorph が登録のためだけに起動する
         if CommandLine.arguments.contains("--dm-register") {
             NSApp.terminate(nil)
+            return
+        }
+        if hold {
+            // DockMorph が終了させる。DockMorph が途中で落ちても Dock に居残らないよう、自分でも切り上げる
+            DispatchQueue.main.asyncAfter(deadline: .now() + 30) { NSApp.terminate(nil) }
             return
         }
         var url = URL(fileURLWithPath: targetPath)

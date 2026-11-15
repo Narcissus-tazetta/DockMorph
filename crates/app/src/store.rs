@@ -72,6 +72,9 @@ pub struct Store {
     icon_guard_attempted: bool,
     icon_guard_busy: bool,
     icon_guard_issue: Option<SharedString>,
+    clearing_leftovers: bool,
+    /// 同じ失敗を 30 秒ごとに出し直さないため
+    leftover_error: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -89,6 +92,7 @@ impl Store {
             ax_trusted: DockMorph::accessibility_trusted(), busy: None, busy_job: DockJob::Animation,
             auto_rejoined: HashMap::new(), icon_guard_target: None, icon_guard_current: None,
             icon_guard_attempted: false, icon_guard_busy: false, icon_guard_issue: None,
+            clearing_leftovers: false, leftover_error: None,
         };
         store.upgrade_launchers(cx);
         store.sync(false, cx);
@@ -124,6 +128,8 @@ impl Store {
         }
         if changed {
             cx.notify();
+            // まとめ直したあとや、分かれていたアプリが終了したあとに、本物のタイルが Dock の右側へ残る
+            self.clear_leftovers(cx);
         }
         self.update_icon_guard(cx);
         let found = self.items.iter().find_map(|i| {
@@ -151,6 +157,39 @@ impl Store {
             _ => {}
         }
         self.rejoin(&id, cx);
+    }
+
+    /// Dock のメニューを操作するので裏で動かす(Dock が応答しないと数秒待つ)
+    fn clear_leftovers(&mut self, cx: &mut Context<Self>) {
+        if self.clearing_leftovers || self.busy.is_some() {
+            return;
+        }
+        self.clearing_leftovers = true;
+        let dm = self.dm.clone();
+        let task = cx.background_spawn(async move { dm.clear_leftover_tiles() });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.clearing_leftovers = false;
+                match result {
+                    Ok(names) => {
+                        this.leftover_error = None;
+                        if !names.is_empty() {
+                            this.notify(Level::Info, "Dock に残っていた本物のタイルを消しました", Some(names.join("、")), cx);
+                        }
+                    }
+                    Err(e) => {
+                        let why = format!("{e:#}");
+                        if this.leftover_error.as_ref() != Some(&why) {
+                            this.notify(Level::Warn, "Dock に残った本物のタイルを消せません", Some(why.clone()), cx);
+                        }
+                        this.leftover_error = Some(why);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn update_icon_guard(&mut self, cx: &mut Context<Self>) {
@@ -290,6 +329,7 @@ impl Store {
             }
         };
         self.last_sync = Some(SystemTime::now());
+        self.clear_leftovers(cx);
         let previous = std::mem::take(&mut self.issues);
         let mut changed = vec![];
         let mut moved = vec![];
@@ -446,19 +486,24 @@ impl Store {
             bundle_id,
             DockJob::Animation,
             match (on, pin) {
-                (true, true) => "Dock に動くタイルを置いています(Dock が再起動します)…",
+                (true, true) => "Dock に動くタイルを置いています…",
                 (true, false) => "起動用アプリを作っています…",
                 (false, _) => "動くタイルを外しています…",
             },
             move |dm| {
                 if on {
                     let t = template.ok_or_else(|| anyhow::anyhow!("DockMorph の場所が分かりません"))?;
-                    dm.enable_animation(&id, &t, pin).map(|r| r.fallback_reason)
+                    dm.enable_animation(&id, &t, pin).map(|r| (r.fallback_reason, r.pin_note))
                 } else {
-                    dm.disable_animation(&id)
+                    dm.disable_animation(&id).map(|warning| (warning, None))
                 }
             },
-            move |this, result, cx| match (result, on) {
+            move |this, result, cx| match (result.map(|(why, note)| {
+                let only_note = why.is_none() && note.is_some();
+                let text = [why, note].into_iter().flatten().collect::<Vec<_>>().join("\n");
+                (!text.is_empty()).then_some((text, only_note))
+            }), on) {
+                (Ok(Some((note, true))), true) => this.notify(Level::Warn, format!("{name} を Dock で動かしています"), Some(note), cx),
                 (Ok(None), true) if pin => this.notify(
                     Level::Success,
                     format!("{name} を Dock で動かしています"),
@@ -471,9 +516,9 @@ impl Store {
                     Some(format!("Dock には置いていません。Spotlight や Raycast で「{name}」の起動用アプリを開くか、この画面の「起動」から開くと、起動中は Dock の右側で動きます")),
                     cx,
                 ),
-                (Ok(Some(why)), true) => this.notify(Level::Warn, format!("{name} を Dock で動かしています(タイルが 2 つ並ぶ方式)"), Some(why), cx),
+                (Ok(Some((why, _))), true) => this.notify(Level::Warn, format!("{name} を Dock で動かしています(タイルが 2 つ並ぶ方式)"), Some(why), cx),
                 (Ok(None), false) => this.notify(Level::Success, format!("{name} の動くタイルを外しました"), None, cx),
-                (Ok(Some(why)), false) => this.notify(Level::Warn, format!("{name} の動くタイルを外しました(Dock を再起動しました)"), Some(why), cx),
+                (Ok(Some((why, _))), false) => this.notify(Level::Warn, format!("{name} の動くタイルを外しました"), Some(why), cx),
                 (Err(e), true) => this.notify(Level::Error, format!("{name} を Dock で動かせません"), Some(format!("{e:#}")), cx),
                 (Err(e), false) => this.notify(Level::Error, format!("{name} の動くタイルを外せません"), Some(format!("{e:#}")), cx),
             },
@@ -496,7 +541,10 @@ impl Store {
                 Ok(())
             },
             move |this, result, cx| match result {
-                Ok(()) => this.notify(Level::Success, format!("{name} のタイルを 1 つにまとめました"), None, cx),
+                Ok(()) => {
+                    this.notify(Level::Success, format!("{name} のタイルを 1 つにまとめました"), None, cx);
+                    this.clear_leftovers(cx);
+                }
                 Err(e) => this.notify(Level::Error, format!("{name} のタイルをまとめられません"), Some(format!("{e:#}")), cx),
             },
             cx,
@@ -512,7 +560,7 @@ impl Store {
         let id = bundle_id.to_string();
         let done = move |this: &mut Self, result: anyhow::Result<Option<String>>, cx: &mut Context<Self>| match result {
             Ok(None) => this.notify(Level::Success, format!("{name} を元のアイコンに戻しました"), None, cx),
-            Ok(Some(why)) => this.notify(Level::Warn, format!("{name} を元のアイコンに戻しました(Dock を再起動しました)"), Some(why), cx),
+            Ok(Some(why)) => this.notify(Level::Warn, format!("{name} を元のアイコンに戻しました"), Some(why), cx),
             Err(e) => this.notify(Level::Error, format!("{name} を元に戻せません"), Some(format!("{e:#}")), cx),
         };
         if self.item(bundle_id).is_some_and(|i| i.entry.animation.is_some()) {

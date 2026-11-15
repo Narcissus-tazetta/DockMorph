@@ -72,13 +72,15 @@ pub enum TileState {
     Split,
 }
 
-/// 起動用アプリが exec の前に立てる印(crates/app/launcher/main.swift と揃える)
-const LAUNCHER_ENV: &[u8] = b"\0DOCKMORPH_LAUNCHER=";
+/// 起動用アプリが exec の前に立てる印(crates/app/launcher/main.swift と揃える)。値は exec したプロセスの pid
+const LAUNCHER_ENV: &[u8] = b"\0DOCKMORPH_LAUNCHER_PID=";
 
 pub struct AnimationResult {
     pub entry: Entry,
     /// exec 方式をやめて本物を別に開く方式にした理由。黙って方式が変わらないよう呼び出し側に必ず見せる
     pub fallback_reason: Option<String>,
+    /// Dock への置き方が頼まれたとおりにならなかったとき(末尾に置いた・Dock を再起動した)の説明
+    pub pin_note: Option<String>,
 }
 
 impl Entry {
@@ -324,7 +326,9 @@ impl DockMorph {
         (n == size).then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
     }
 
-    /// 引数と環境変数の領域をそのまま探す。アプリが argv を書き換えていても位置に頼らずに済む
+    /// 引数と環境変数の領域をそのまま探す。アプリが argv を書き換えていても位置に頼らずに済む。
+    /// 印は子プロセスにも引き継がれる。アプリが自分を起動し直した新しいプロセス(更新後の再起動など)は本物のタイルに
+    /// 出るので、印の pid が自分のものと一致するときだけ「起動用アプリが exec したプロセス」と見なす
     fn launched_by_launcher(pid: i32) -> bool {
         let mut argmax: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>();
@@ -338,7 +342,56 @@ impl DockMorph {
         if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) } != 0 {
             return false;
         }
-        buf[..len].windows(LAUNCHER_ENV.len()).any(|w| w == LAUNCHER_ENV)
+        let area = &buf[..len];
+        let own = pid.to_string();
+        area.windows(LAUNCHER_ENV.len()).position(|w| w == LAUNCHER_ENV).is_some_and(|at| {
+            area[at + LAUNCHER_ENV.len()..].split(|b| *b == 0).next() == Some(own.as_bytes())
+        })
+    }
+
+    /// bundle_id 以外の登録に、動くタイルにまとまって起動中のものがあるか。Dock を再起動するとそれらが分かれる
+    fn others_joined(&self, bundle_id: &str) -> Result<bool> {
+        Ok(self.load_entries()?.iter().any(|e| e.bundle_id != bundle_id && self.tile_state(e) == Some(TileState::Joined)))
+    }
+
+    /// 動くタイルにまとめる方式のアプリの、起動していない本物のタイルが Dock に残っていたら消す。消した登録の名前を返す。
+    /// 本物が起動用アプリを通さずに動くと(直接開かれた・Dock の再起動で分かれた)、Dock は終了後も本物を
+    /// 「最近使ったアプリ」に残す。動くタイルの横に同じアプリが並び、そこから開くとまた本物が直接開く
+    pub fn clear_leftover_tiles(&self) -> Result<Vec<String>> {
+        // 許可がないことは画面の「アクセシビリティの許可がありません」で伝えている
+        if !dock_ax::trusted() {
+            return Ok(vec![]);
+        }
+        let Some(pid) = Self::dock_pid() else { return Ok(vec![]) };
+        let mut cleared = vec![];
+        for entry in self.load_entries()? {
+            if !entry.animation.as_ref().is_some_and(|a| a.direct) {
+                continue;
+            }
+            let target = self.target_path(&entry)?;
+            if !target.exists() || !dock_ax::has_idle(pid, &target)? {
+                continue;
+            }
+            // ユーザーが自分でピン留めした本物は残す
+            let (_, mut dock) = Self::read_dock()?;
+            if Self::pinned_urls(&mut dock)?.contains(&Self::file_url(&target)?) {
+                continue;
+            }
+            if dock_ax::remove_idle(pid, &target)? {
+                cleared.push(entry.display_name());
+            }
+        }
+        Ok(cleared)
+    }
+
+    fn pinned_urls(dock: &mut plist::Value) -> Result<Vec<String>> {
+        Ok(Self::persistent_apps(dock)?
+            .iter()
+            .filter_map(|t| {
+                t.as_dictionary()?.get("tile-data")?.as_dictionary()?.get("file-data")?.as_dictionary()?
+                    .get("_CFURLString")?.as_string().map(str::to_string)
+            })
+            .collect())
     }
 
     fn dock_start() -> Option<(u64, u64)> {
@@ -483,16 +536,7 @@ impl DockMorph {
     /// ピン留めされている、または付ける前から起動している。最後に Dock を更新した後に付けたものだけが対象
     pub fn dock_stale(&self, entries: &[Entry]) -> Vec<bool> {
         let pinned: Vec<String> = match Self::read_dock() {
-            Ok((_, mut dock)) => Self::persistent_apps(&mut dock)
-                .map(|apps| {
-                    apps.iter()
-                        .filter_map(|t| {
-                            t.as_dictionary()?.get("tile-data")?.as_dictionary()?.get("file-data")?.as_dictionary()?
-                                .get("_CFURLString")?.as_string().map(str::to_string)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+            Ok((_, mut dock)) => Self::pinned_urls(&mut dock).unwrap_or_default(),
             Err(e) => {
                 eprintln!("Dock のピン留めを読めません: {e:#}");
                 vec![]
@@ -1252,6 +1296,70 @@ impl DockMorph {
         Ok(replaced.get())
     }
 
+    /// Dock を再起動せずにピン留めする。タイルを足す操作は Dock のメニューに無いので、起動用アプリを起動したままにして
+    /// 起動中のタイルを出し、そのメニューの「Dock に残す」を押す。設定上はアプリの並びの末尾に付く。
+    /// 本物がピン留めされていたら、そちらはメニューで外す
+    fn pin_by_menu(&self, entry: &Entry, launcher: &Path) -> Result<()> {
+        let pid = Self::dock_pid().ok_or_else(|| anyhow!("Dock が起動していません"))?;
+        let launcher_url = Self::file_url(launcher)?;
+        let id = Self::launcher_id(&entry.bundle_id);
+        Self::run(Command::new("/usr/bin/open").args(["-g", "-n"]).arg(launcher).args(["--args", "--dm-hold"]))?;
+        let kept = (|| {
+            let start = std::time::Instant::now();
+            while !dock_ax::keep(pid, launcher)? {
+                if start.elapsed() > std::time::Duration::from_secs(10) {
+                    bail!("起動用アプリのタイルが Dock に出ません");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Self::wait_pinned(|apps| apps.iter().any(|t| Self::tile_matches(t, &id, &launcher_url)))
+        })();
+        let executable = launcher.join("Contents/MacOS/DMLauncher");
+        for held in Self::pids_running(&executable) {
+            unsafe { libc::kill(held, libc::SIGTERM) };
+        }
+        kept?;
+        for real in [entry.source_path.clone(), self.target_path(entry)?] {
+            let url = Self::file_url(&real)?;
+            let (_, mut dock) = Self::read_dock()?;
+            if !Self::pinned_urls(&mut dock)?.contains(&url) {
+                continue;
+            }
+            if !dock_ax::unpin(pid, &real)? {
+                bail!("Dock に本物のタイルが見つかりません: {}", real.display());
+            }
+            Self::wait_pinned(|apps| !apps.iter().any(|t| Self::tile_matches(t, "", &url)))?;
+        }
+        Ok(())
+    }
+
+    /// Dock は設定ファイルへ数秒遅れて書く(実測で約 4 秒)。書かれる前に続きの処理が設定を読むと古い並びを見る
+    fn wait_pinned(done: impl Fn(&[plist::Value]) -> bool) -> Result<()> {
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(10) {
+            let (_, mut dock) = Self::read_dock()?;
+            if done(Self::persistent_apps(&mut dock)?) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        bail!("メニューを操作しましたが、Dock の設定に反映されません")
+    }
+
+    fn pids_running(executable: &Path) -> Vec<i32> {
+        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        let mut pids = vec![0i32; count.max(0) as usize * 2];
+        let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), (pids.len() * std::mem::size_of::<i32>()) as i32) };
+        pids.truncate(n.max(0) as usize);
+        let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        pids.into_iter()
+            .filter(|pid| {
+                let len = unsafe { libc::proc_pidpath(*pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+                len > 0 && Path::new(std::ffi::OsStr::from_bytes(&buf[..len as usize])) == executable
+            })
+            .collect()
+    }
+
     fn pin_launcher_once(&self, entry: &Entry, launcher: &Path) -> Result<bool> {
         let (original, mut dock) = Self::read_dock()?;
         let launcher_url = Self::file_url(launcher)?;
@@ -1293,8 +1401,19 @@ impl DockMorph {
             return Ok(None);
         }
         let mut fallback = None;
-        if !restore_real {
-            match self.unpin_by_menu(anim, &id, &launcher_url) {
+        // 本物を元の位置に戻すには Dock の再起動が要る。起動中のほかの動くタイルが分かれるので、そのときは位置を諦める
+        let keep_dock = restore_real && dock_ax::trusted() && self.others_joined(&entry.bundle_id)?;
+        if !restore_real || keep_dock {
+            let unpinned = if pinned { self.unpin_by_menu(anim, &id, &launcher_url) } else { Ok(()) };
+            match unpinned {
+                Ok(()) if keep_dock => {
+                    // 起動中の本物のタイルなら、メニューでピン留めに戻せる
+                    let kept = Self::dock_pid().is_some_and(|pid| dock_ax::keep(pid, &entry.source_path).unwrap_or(false));
+                    return Ok((!kept).then(|| format!(
+                        "起動中のほかの動くタイルを分けないよう Dock を再起動しなかったので、{} を Dock に戻していません。必要なら Dock に置き直してください",
+                        entry.display_name()
+                    )));
+                }
                 Ok(()) => return Ok(None),
                 Err(e) => {
                     let hint = if dock_ax::trusted() {
@@ -1319,16 +1438,7 @@ impl DockMorph {
         if !dock_ax::unpin(pid, &anim.launcher_path)? {
             bail!("Dock に起動用アプリのタイルが見つかりません");
         }
-        // Dock は設定ファイルへ数秒遅れて書く(実測で約 4 秒)。書かれる前に続きの処理が設定を読むと古い並びを見る
-        let start = std::time::Instant::now();
-        while start.elapsed() < std::time::Duration::from_secs(10) {
-            let (_, mut dock) = Self::read_dock()?;
-            if !Self::persistent_apps(&mut dock)?.iter().any(|t| Self::tile_matches(t, id, launcher_url)) {
-                return Ok(());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-        bail!("メニューで外しましたが、Dock の設定に反映されません")
+        Self::wait_pinned(|apps| !apps.iter().any(|t| Self::tile_matches(t, id, launcher_url)))
     }
 
     fn unpin_launcher_once(&self, entry: &Entry, anim: &Animation) -> Result<()> {
@@ -1392,6 +1502,7 @@ impl DockMorph {
         });
         let direct = fallback_reason.is_none();
         let mut pinned_animation = None;
+        let mut pin_note = None;
         let result = (|| {
             Self::run(Command::new("/usr/bin/ditto").arg(template).arg(&launcher))?;
             self.refresh_launcher(&entries[i], &launcher, direct)?;
@@ -1405,14 +1516,32 @@ impl DockMorph {
                     Self::tile_matches(tile, bundle_id, &source_url) || Self::tile_matches(tile, bundle_id, &target_url)
                 });
                 pinned_animation = Some(anim.clone());
-                anim.replaced_pin |= self.pin_launcher(&entries[i], &launcher)?;
-                pinned_animation = Some(anim.clone());
-            }
-            // 一度も起動されていないアプリは、ピン留めしただけでは Dock がプラグインを読み込まない。ピン留めのあとに
-            // 一度起動すると読み込む(実測)。本物は開かずにすぐ終了する引数で起動する。
-            // ピン留めしないなら、最初に開かれたときに読み込まれるので要らない(実測)
-            if pin {
-                Self::run(Command::new("/usr/bin/open").args(["-W", "-g", "-n"]).arg(&launcher).args(["--args", "--dm-register"]))?;
+                // Dock を再起動すると、起動中のほかの動くタイルが分かれる。そのときだけメニューでピン留めする。
+                // メニューで残したタイルは、Dock が次に再起動するまで右側(起動中のアプリの並び)に出たままになる(実測)ので、
+                // 分かれるタイルが無ければ、すぐ正しい位置に出る再起動のほうを使う
+                let others = self.others_joined(bundle_id)?;
+                let by_menu = if !others {
+                    Err(String::new())
+                } else if dock_ax::trusted() {
+                    self.pin_by_menu(&entries[i], &launcher).map_err(|e| format!("{e:#}"))
+                } else {
+                    Err("アクセシビリティの許可がありません".into())
+                };
+                match by_menu {
+                    Ok(()) => {
+                        pin_note = Some("起動中のほかの動くタイルを分けないよう、Dock を再起動せずに置きました。動くタイルはいったん Dock の右側に出ていて、Dock が次に再起動したとき(ログインし直しなど)にアプリの並びの末尾へ移ります".into());
+                    }
+                    Err(why) => {
+                        anim.replaced_pin |= self.pin_launcher(&entries[i], &launcher)?;
+                        pinned_animation = Some(anim.clone());
+                        // 一度も起動されていないアプリは、ピン留めしただけでは Dock がプラグインを読み込まない。ピン留めのあとに
+                        // 一度起動すると読み込む(実測)。本物は開かずにすぐ終了する引数で起動する
+                        Self::run(Command::new("/usr/bin/open").args(["-W", "-g", "-n"]).arg(&launcher).args(["--args", "--dm-register"]))?;
+                        if others {
+                            pin_note = Some(format!("Dock を再起動して置いたので、起動中のほかの動くタイルが分かれました({why})。分かれたアプリは「まとめ直す」で戻せます"));
+                        }
+                    }
+                }
             }
             entries[i].animation = Some(anim);
             self.save_entries(&entries)?;
@@ -1441,7 +1570,7 @@ impl DockMorph {
             }
             return Err(e);
         }
-        Ok(AnimationResult { entry: entries[i].clone(), fallback_reason })
+        Ok(AnimationResult { entry: entries[i].clone(), fallback_reason, pin_note })
     }
 
     /// 本人以外のアクセスを macOS が止めるデータ(com.apple.macl 付き)を持つアプリか。exec した起動用アプリは

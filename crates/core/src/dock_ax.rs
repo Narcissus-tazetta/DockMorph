@@ -1,4 +1,4 @@
-//! Dock のタイルのメニュー(オプション → Dock から削除)を AX で押して、ピン留めを外す。
+//! Dock のタイルのメニュー(オプション → Dock から削除 / Dock に残す)を AX で押して、タイルを外す・ピン留めする。
 //! defaults import + killall Dock と違って Dock を再起動しないので、起動中のほかの動くタイルが分かれない(実測)。
 //! 呼び出し元のプロセスにアクセシビリティの許可が要る。
 
@@ -25,6 +25,48 @@ pub fn request_trust() -> bool {
 
 /// app を指すタイルのピン留めを外す。そのタイルが Dock に無ければ Ok(false)
 pub fn unpin(dock_pid: u32, app: &Path) -> Result<bool> {
+    let Some(tile) = find_tile(dock_pid, app, None)? else { return Ok(false) };
+    let (remove, keep) = (dock_strings("REMOVE_FROM_DOCK")?, dock_strings("KEEP_IN_DOCK")?);
+    // 起動中のアプリのタイルには「Dock から削除」が無く、チェックの付いた「Dock に残す」を外すとピン留めが外れる
+    choose(&tile, "Dock から削除", |items| {
+        items.iter().find(|i| is(i, &remove)).or_else(|| items.iter().find(|i| is(i, &keep) && checked(i))).cloned()
+    })?;
+    Ok(true)
+}
+
+/// app を指す、起動していないタイルを Dock から消す。ピン留めのタイルも「最近使ったアプリ」に残ったタイルも消える(実測)。
+/// そういうタイルが無ければ Ok(false)
+pub fn remove_idle(dock_pid: u32, app: &Path) -> Result<bool> {
+    let Some(tile) = find_tile(dock_pid, app, Some(false))? else { return Ok(false) };
+    let remove = dock_strings("REMOVE_FROM_DOCK")?;
+    choose(&tile, "Dock から削除", |items| items.iter().find(|i| is(i, &remove)).cloned())?;
+    Ok(true)
+}
+
+pub fn has_idle(dock_pid: u32, app: &Path) -> Result<bool> {
+    Ok(find_tile(dock_pid, app, Some(false))?.is_some())
+}
+
+/// 起動中の app のタイルをピン留めする。起動中のタイルが無ければ Ok(false)。
+/// タイルを足す操作はメニューに無いが、起動中のタイルを残すことはできる
+pub fn keep(dock_pid: u32, app: &Path) -> Result<bool> {
+    let Some(tile) = find_tile(dock_pid, app, Some(true))? else { return Ok(false) };
+    let keep = dock_strings("KEEP_IN_DOCK")?;
+    let mut already = false;
+    let result = choose(&tile, "Dock に残す", |items| {
+        let item = items.iter().find(|i| is(i, &keep))?;
+        already = checked(item);
+        // すでにピン留めされているなら、押すと外れてしまう
+        (!already).then(|| item.clone())
+    });
+    if already {
+        return Ok(true);
+    }
+    result.map(|()| true)
+}
+
+/// app を指すタイル。running を指定したら、起動中かどうかが合うものだけ
+fn find_tile(dock_pid: u32, app: &Path, running: Option<bool>) -> Result<Option<CFRetained<AXUIElement>>> {
     if !trusted() {
         bail!("アクセシビリティの許可がありません");
     }
@@ -32,14 +74,25 @@ pub fn unpin(dock_pid: u32, app: &Path) -> Result<bool> {
     unsafe { dock.set_messaging_timeout(2.0) };
     let list = children(&dock).into_iter().find(|e| string(e, "AXRole").as_deref() == Some("AXList")).ok_or_else(|| anyhow!("Dock のタイルの一覧が見つかりません"))?;
     let want = app.canonicalize()?;
-    let Some(tile) = children(&list).into_iter().find(|t| tile_path(t).is_some_and(|p| p.canonicalize().ok().as_deref() == Some(want.as_path()))) else {
-        return Ok(false);
-    };
+    Ok(children(&list).into_iter().find(|t| {
+        tile_path(t).is_some_and(|p| p.canonicalize().ok().as_deref() == Some(want.as_path()))
+            && running.is_none_or(|r| r == attr(t, "AXIsApplicationRunning").and_then(|v| v.downcast::<CFBoolean>().ok()).is_some_and(|b| b.as_bool()))
+    }))
+}
 
-    let (options, remove, keep) = (dock_strings("OPTIONS")?, dock_strings("REMOVE_FROM_DOCK")?, dock_strings("KEEP_IN_DOCK")?);
-    let is = |e: &AXUIElement, set: &HashSet<String>| string(e, "AXTitle").is_some_and(|t| set.contains(&t));
-    perform(&tile, "AXShowMenu")?;
-    let menu = wait_for(Duration::from_secs(1), || children(&tile).into_iter().find(|e| string(e, "AXRole").as_deref() == Some("AXMenu")))
+fn is(e: &AXUIElement, set: &HashSet<String>) -> bool {
+    string(e, "AXTitle").is_some_and(|t| set.contains(&t))
+}
+
+fn checked(item: &AXUIElement) -> bool {
+    string(item, "AXMenuItemMarkChar").is_some_and(|m| !m.is_empty())
+}
+
+/// タイルのメニューを開き、「オプション」の中から pick が選んだ項目を押す。選べなければメニューを閉じて失敗にする
+fn choose(tile: &AXUIElement, what: &str, pick: impl FnOnce(&[CFRetained<AXUIElement>]) -> Option<CFRetained<AXUIElement>>) -> Result<()> {
+    let options = dock_strings("OPTIONS")?;
+    perform(tile, "AXShowMenu")?;
+    let menu = wait_for(Duration::from_secs(1), || children(tile).into_iter().find(|e| string(e, "AXRole").as_deref() == Some("AXMenu")))
         .ok_or_else(|| anyhow!("タイルのメニューが開きません"))?;
     let result = (|| {
         let items = children(&menu);
@@ -49,19 +102,14 @@ pub fn unpin(dock_pid: u32, app: &Path) -> Result<bool> {
             .and_then(|i| children(i).into_iter().next())
             .ok_or_else(|| anyhow!("メニューに「オプション」がありません(項目: {})", titles(&items)))?;
         let items = children(&submenu);
-        // 起動中のアプリのタイルには「Dock から削除」が無く、チェックの付いた「Dock に残す」を外すとピン留めが外れる
-        let target = items
-            .iter()
-            .find(|i| is(i, &remove))
-            .or_else(|| items.iter().find(|i| is(i, &keep) && string(i, "AXMenuItemMarkChar").is_some_and(|m| !m.is_empty())))
-            .ok_or_else(|| anyhow!("メニューに「Dock から削除」がありません(項目: {})", titles(&items)))?;
-        perform(target, "AXPress")
+        let target = pick(&items).ok_or_else(|| anyhow!("メニューに「{what}」がありません(項目: {})", titles(&items)))?;
+        perform(&target, "AXPress")
     })();
     if result.is_err() {
         // 開いたメニューを残さない。閉じられなくても元のエラーのほうが原因に近いので、そちらを返す
         let _ = perform(&menu, "AXCancel");
     }
-    result.map(|()| true)
+    result
 }
 
 /// Dock のメニューの文言を、Dock 自身の全言語の翻訳から集める。

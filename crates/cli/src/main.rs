@@ -11,10 +11,12 @@ const USAGE: &str = "usage:
                                     登録済みのアプリの画像を差し替える
   dockmorph animate <bundle-id> on <Launcher.app> [--no-pin]
   dockmorph animate <bundle-id> off
-                                    Dock で画像を動かす(実験的)。起動用アプリを作って Dock にピン留めする(Dock が再起動する)。
+                                    Dock で画像を動かす(実験的)。起動用アプリを作って Dock にピン留めする。
+                                    本物のピン留めの位置を置き換えるときだけ Dock が再起動する。
                                     --no-pin ならピン留めせず、起動用アプリから開いたときだけ Dock の右側で動く。
                                     Launcher.app は DockMorph.app/Contents/Resources にある雛形
   dockmorph rejoin <bundle-id>      本物のタイルが別に出ているとき、アプリを再起動して動くタイル 1 つに戻す
+  dockmorph clear-leftovers         動くタイルのアプリの、Dock に残った本物のタイル(起動していないもの)を消す
   dockmorph upgrade-launchers <Launcher.app>
                                     作成済みの起動用アプリを新しい雛形に入れ替える
   dockmorph refresh-dock            Dock が覚えているアイコンを消して Dock を再起動する(アプリは終了しない)
@@ -88,6 +90,9 @@ fn main() -> Result<()> {
             if let Some(reason) = &r.fallback_reason {
                 eprintln!("warning: {reason}");
             }
+            if let Some(note) = &r.pin_note {
+                eprintln!("note: {note}");
+            }
             if let Some(a) = &r.entry.animation {
                 let mode = if a.direct { "direct" } else { "separate" };
                 println!("animated {} → {} [{mode}]{}", r.entry.bundle_id, a.launcher_path.display(), if a.replaced_pin { " (ピン留めを置き換え)" } else { "" });
@@ -100,6 +105,11 @@ fn main() -> Result<()> {
             println!("stopped {}", args[1]);
         }
         Some("rejoin") if args.len() == 2 => dm.rejoin(&args[1])?,
+        Some("clear-leftovers") if args.len() == 1 => {
+            for name in dm.clear_leftover_tiles()? {
+                println!("cleared {name}");
+            }
+        }
         Some("upgrade-launchers") if args.len() == 2 => {
             for name in dm.upgrade_launchers(&PathBuf::from(&args[1]))? {
                 println!("upgraded {name}");

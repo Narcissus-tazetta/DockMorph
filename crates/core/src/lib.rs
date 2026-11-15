@@ -178,7 +178,7 @@ impl DockMorph {
     pub fn new() -> Result<Self> {
         Ok(match std::env::var_os("DOCKMORPH_HOME") {
             Some(p) => {
-                let home = PathBuf::from(p);
+                let home = std::path::absolute(p)?;
                 Self { launchers: home.join("Launchers"), home }
             }
             None => {
@@ -194,7 +194,7 @@ impl DockMorph {
     fn icons_dir(&self) -> PathBuf { self.home.join("Icons") }
     fn launchers_dir(&self) -> PathBuf { self.launchers.clone() }
     fn dock_backups_dir(&self) -> PathBuf { self.home.join("DockBackups") }
-    fn entries_file(&self) -> PathBuf { self.home.join("entries.json") }
+    pub fn entries_file(&self) -> PathBuf { self.home.join("entries.json") }
     /// 更新日時が、最後に Dock のアイコンの記憶を消した時刻
     fn dock_refreshed_marker(&self) -> PathBuf { self.home.join("dock-refreshed") }
 
@@ -257,13 +257,38 @@ impl DockMorph {
         if bundle_id.is_empty() {
             bail!("CFBundleIdentifier がありません: {}", app.display());
         }
+        if !Self::single_component(&bundle_id) {
+            bail!("CFBundleIdentifier が不正です: {}", app.display());
+        }
         let exec = s("CFBundleExecutable");
-        let mtime = fs::metadata(app.join("Contents/MacOS").join(&exec))
-            .with_context(|| format!("実行ファイルが見つかりません: {exec}"))?
-            .modified()?
+        if !Self::single_component(&exec) {
+            bail!("CFBundleExecutable が不正です: {}", app.display());
+        }
+        let executable = app.join("Contents/MacOS").join(&exec);
+        let metadata = fs::metadata(&executable)
+            .with_context(|| format!("実行ファイルが見つかりません: {}", executable.display()))?;
+        if !metadata.is_file() {
+            bail!("実行ファイルが通常ファイルではありません: {}", executable.display());
+        }
+        let mtime = metadata.modified()?
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
         Ok(AppInfo { bundle_id, fingerprint: format!("{}|{}|{}", s("CFBundleShortVersionString"), s("CFBundleVersion"), mtime) })
+    }
+
+    fn single_component(value: &str) -> bool {
+        let mut parts = Path::new(value).components();
+        !value.contains('/') && !value.contains('\0')
+            && matches!(parts.next(), Some(std::path::Component::Normal(_)))
+            && parts.next().is_none()
+    }
+
+    fn registered_app_info(app: &Path, bundle_id: &str) -> Result<AppInfo> {
+        let info = Self::app_info(app)?;
+        if info.bundle_id != bundle_id {
+            bail!("登録と異なるアプリです: {} (登録: {bundle_id}, 実際: {})", app.display(), info.bundle_id);
+        }
+        Ok(info)
     }
 
     /// 自分の複製は LaunchServices に同じ bundle ID の別候補として登録されているので、本物を探すときは除外する
@@ -275,13 +300,21 @@ impl DockMorph {
     }
 
     fn running_app(bundle: &Path) -> Option<Retained<NSRunningApplication>> {
+        let bundle = bundle.canonicalize().ok()?;
         NSWorkspace::sharedWorkspace().runningApplications().iter().find(|a| {
-            a.bundleURL().and_then(|u| u.path()).is_some_and(|p| Path::new(&p.to_string()) == bundle)
+            a.bundleURL().and_then(|u| u.path()).is_some_and(|p| {
+                Path::new(&p.to_string()).canonicalize().ok().as_deref() == Some(bundle.as_path())
+            })
         })
     }
 
     pub fn is_running(bundle: &Path) -> bool {
         Self::running_app(bundle).is_some()
+    }
+
+    pub fn running_process(&self, entry: &Entry) -> Option<(i32, (u64, u64))> {
+        let pid = Self::running_app(&self.target_path(entry).ok()?)?.processIdentifier();
+        Some((pid, Self::process_start(pid)?))
     }
 
     fn process_start(pid: i32) -> Option<(u64, u64)> {
@@ -379,7 +412,9 @@ impl DockMorph {
         if !anim.direct {
             bail!("このアプリは本物を別に開く方式なので、タイルを 1 つにまとめられません: {}", entry.display_name());
         }
-        if let Some(app) = Self::running_app(&self.target_path(entry)?) {
+        let target = self.target_path(entry)?;
+        Self::registered_app_info(&target, bundle_id)?;
+        if let Some(app) = Self::running_app(&target) {
             let pid = app.processIdentifier();
             if !app.terminate() {
                 bail!("アプリに終了を頼めません: {}", entry.display_name());
@@ -530,17 +565,35 @@ impl DockMorph {
     }
 
     fn make_clone(source: &Path, dest: &Path, icon: &Path) -> Result<()> {
-        fs::create_dir_all(dest.parent().ok_or_else(|| anyhow!("親ディレクトリがありません"))?)?;
-        if dest.exists() {
-            fs::remove_dir_all(dest)?;
+        let parent = dest.parent().ok_or_else(|| anyhow!("親ディレクトリがありません"))?;
+        fs::create_dir_all(parent)?;
+        let (staged, reservation) = Self::create_unique_file(parent, ".dockmorph-clone", "app")?;
+        drop(reservation);
+        fs::remove_file(&staged)?;
+        let result = (|| {
+            let source_c = CString::new(source.as_os_str().as_bytes())?;
+            let staged_c = CString::new(staged.as_os_str().as_bytes())?;
+            if unsafe { libc::clonefile(source_c.as_ptr(), staged_c.as_ptr(), 0) } != 0 {
+                bail!("クローン失敗 ({}): {} → {}", std::io::Error::last_os_error(), source.display(), dest.display());
+            }
+            Self::apply_icon(icon, &staged)?;
+            if dest.exists() {
+                // 作成やアイコン設定の失敗で、動いていた旧クローンまで失わないよう最後に原子的に交換する。
+                let dest_c = CString::new(dest.as_os_str().as_bytes())?;
+                if unsafe { libc::renamex_np(staged_c.as_ptr(), dest_c.as_ptr(), libc::RENAME_SWAP) } != 0 {
+                    return Err(std::io::Error::last_os_error()).context("クローンを入れ替えられません");
+                }
+            } else {
+                fs::rename(&staged, dest)?;
+            }
+            Ok(())
+        })();
+        if staged.exists() {
+            if let Err(e) = fs::remove_dir_all(&staged) {
+                eprintln!("クローンの一時ファイルを消せません ({}): {e}", staged.display());
+            }
         }
-        // 実コピーにフォールバックしない: 容量を食う上、更新追従の前提(安価な再作成)が崩れるため
-        let s = CString::new(source.as_os_str().as_bytes())?;
-        let d = CString::new(dest.as_os_str().as_bytes())?;
-        if unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), 0) } != 0 {
-            bail!("クローン失敗 ({}): {} → {}", std::io::Error::last_os_error(), source.display(), dest.display());
-        }
-        Self::apply_icon(icon, dest)
+        result
     }
 
     /// 正方形でない画像は、そのまま渡すと正方形に引き伸ばされる。縦横比を保って透明な正方形の中央に置く
@@ -628,6 +681,8 @@ impl DockMorph {
     pub fn add(&self, source: &Path, image: &Path, force_clone: bool) -> Result<AddResult> {
         let _lock = self.lock()?;
         let mut entries = self.load_entries()?;
+        let source = source.canonicalize().with_context(|| format!("アプリのパスを解決できません: {}", source.display()))?;
+        let source = source.as_path();
         let info = Self::app_info(source)?;
         if entries.iter().any(|e| e.bundle_id == info.bundle_id) {
             bail!("登録済みです: {} (画像を変えるなら set-image か、画面の「画像を変更」を使ってください)", info.bundle_id);
@@ -685,12 +740,38 @@ impl DockMorph {
 
     /// 差し替えのたびに別名で保存する。同じパスに上書きすると、GUI がパスをキーに持つ画像キャッシュで古い画像を出し続ける
     fn store_image(&self, bundle_id: &str, image: &Path) -> Result<PathBuf> {
+        if !Self::single_component(bundle_id) {
+            bail!("CFBundleIdentifier が不正です");
+        }
         fs::create_dir_all(self.icons_dir())?;
         let ext = image.extension().and_then(|e| e.to_str()).unwrap_or("png").to_lowercase();
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
-        let stored = self.icons_dir().join(format!("{bundle_id}.{stamp}.{ext}"));
-        fs::copy(image, &stored).with_context(|| format!("画像をコピーできません: {}", image.display()))?;
+        let (stored, mut output) = Self::create_unique_file(&self.icons_dir(), bundle_id, &ext)?;
+        let result: Result<()> = (|| {
+            let mut input = fs::File::open(image)?;
+            std::io::copy(&mut input, &mut output)?;
+            output.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            if let Err(rm) = fs::remove_file(&stored) {
+                eprintln!("後片付けに失敗 ({}): {rm}", stored.display());
+            }
+            return Err(e).with_context(|| format!("画像をコピーできません: {}", image.display()));
+        }
         Ok(stored)
+    }
+
+    fn create_unique_file(dir: &Path, prefix: &str, ext: &str) -> Result<(PathBuf, fs::File)> {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let mut sequence = 0u64;
+        loop {
+            let path = dir.join(format!("{prefix}.{stamp}.{sequence:020}.{ext}"));
+            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok((path, file)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => sequence += 1,
+                Err(e) => return Err(e).with_context(|| format!("作成できません: {}", path.display())),
+            }
+        }
     }
 
     /// 登録済みのアプリの画像だけを差し替える。登録を外して付け直すと、元のアイコンに戻る瞬間ができて Dock がそれを拾いうる
@@ -698,11 +779,12 @@ impl DockMorph {
         let _lock = self.lock()?;
         let mut entries = self.load_entries()?;
         let i = entries.iter().position(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("未登録です: {bundle_id}"))?;
-        Self::load_image(image)?;
         let target = self.target_path(&entries[i])?;
         if !target.join("Contents/Info.plist").exists() {
             bail!("アイコンを付ける先のアプリが見つかりません。同期してから試してください: {}", target.display());
         }
+        Self::registered_app_info(&target, bundle_id)?;
+        Self::load_image(image)?;
         let old = entries[i].icon_path.clone();
         let stored = self.store_image(bundle_id, image)?;
         let result = (|| {
@@ -765,6 +847,10 @@ impl DockMorph {
         let mut entries = self.load_entries()?;
         let i = entries.iter().position(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("未登録です: {bundle_id}"))?;
         let entry = entries[i].clone();
+        let target = self.target_path(&entry)?;
+        if target.exists() {
+            Self::registered_app_info(&target, bundle_id)?;
+        }
         let mut warning = None;
         if let Some(anim) = &entry.animation {
             warning = self.teardown_animation(&entry, anim)?;
@@ -789,11 +875,18 @@ impl DockMorph {
                 }
             }
         }
-        if entry.icon_path.exists() {
-            fs::remove_file(&entry.icon_path)?;
-        }
         entries.remove(i);
         self.save_entries(&entries)?;
+        if entry.icon_path.exists() {
+            if let Err(e) = fs::remove_file(&entry.icon_path) {
+                let detail = format!("登録は削除しましたが、保存画像を消せません ({}): {e}", entry.icon_path.display());
+                eprintln!("{detail}");
+                warning = Some(match warning {
+                    Some(previous) => format!("{previous}。{detail}"),
+                    None => detail,
+                });
+            }
+        }
         Ok(warning)
     }
 
@@ -829,7 +922,7 @@ impl DockMorph {
             entry.source_path = found.clone();
             relocated = Some(found);
         }
-        let info = Self::app_info(&entry.source_path)?;
+        let info = Self::registered_app_info(&entry.source_path, &id)?;
         let result = match entry.mode {
             Mode::InPlace => {
                 if Self::has_custom_icon(&entry.source_path) {
@@ -843,6 +936,9 @@ impl DockMorph {
             Mode::Clone => {
                 let clone = self.clone_path(entry)?;
                 let exists = clone.exists();
+                if clone.join("Contents/Info.plist").exists() {
+                    Self::registered_app_info(&clone, &id)?;
+                }
                 if info.fingerprint == entry.fingerprint && exists && Self::has_custom_icon(&clone) {
                     SyncResult::UpToDate(id.clone())
                 } else if exists && Self::is_running(&clone) {
@@ -862,7 +958,14 @@ impl DockMorph {
                 bail!("Dock で動かすための起動用アプリが見つかりません。「Dock で動かす」をオフにしてからオンにし直してください: {}", anim.launcher_path.display());
             }
             let target = self.target_path(entry)?;
-            if Self::launcher_target(&anim.launcher_path).as_deref() != Some(target.as_path()) {
+            let tile_image = anim.launcher_path.join("Contents/Resources/tile-image");
+            let image_matches = match fs::read(&tile_image) {
+                Ok(bytes) => bytes == fs::read(&entry.icon_path)
+                    .with_context(|| format!("画像を読めません: {}", entry.icon_path.display()))?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e).with_context(|| format!("画像を読めません: {}", tile_image.display())),
+            };
+            if Self::launcher_target(&anim.launcher_path).as_deref() != Some(target.as_path()) || !image_matches {
                 self.refresh_launcher(entry, &anim.launcher_path, anim.direct)?;
             }
         }
@@ -1031,9 +1134,11 @@ impl DockMorph {
     fn write_dock(&self, original: &[u8], value: &plist::Value) -> Result<()> {
         let dir = self.dock_backups_dir();
         fs::create_dir_all(&dir)?;
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
-        fs::write(dir.join(format!("com.apple.dock.{stamp}.plist")), original)?;
-        let mut backups: Vec<_> = fs::read_dir(&dir)?.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        use std::io::Write;
+        let (_, mut backup) = Self::create_unique_file(&dir, "com.apple.dock", "plist")?;
+        backup.write_all(original)?;
+        backup.sync_all()?;
+        let mut backups = fs::read_dir(&dir)?.map(|e| e.map(|e| e.path())).collect::<std::io::Result<Vec<_>>>()?;
         backups.sort();
         for old in backups.iter().take(backups.len().saturating_sub(20)) {
             fs::remove_file(old)?;
@@ -1136,11 +1241,15 @@ impl DockMorph {
     fn pin_launcher(&self, entry: &Entry, launcher: &Path) -> Result<bool> {
         let launcher_url = Self::file_url(launcher)?;
         let id = Self::launcher_id(&entry.bundle_id);
-        let replaced = self.edit_dock(
-            |dm| dm.pin_launcher_once(entry, launcher).map(Some),
+        let replaced = std::cell::Cell::new(false);
+        self.edit_dock(
+            |dm| {
+                replaced.set(dm.pin_launcher_once(entry, launcher)? || replaced.get());
+                Ok(Some(()))
+            },
             |apps| apps.iter().any(|t| Self::tile_matches(t, &id, &launcher_url)),
         )?;
-        Ok(replaced.unwrap_or(false))
+        Ok(replaced.get())
     }
 
     fn pin_launcher_once(&self, entry: &Entry, launcher: &Path) -> Result<bool> {
@@ -1149,23 +1258,24 @@ impl DockMorph {
         let source_url = Self::file_url(&entry.source_path)?;
         let target_url = Self::file_url(&self.target_path(entry)?)?;
         let apps = Self::persistent_apps(&mut dock)?;
-        apps.retain(|t| !Self::tile_matches(t, &Self::launcher_id(&entry.bundle_id), &launcher_url));
-        let real = apps.iter().position(|t| {
-            Self::tile_matches(t, &entry.bundle_id, &source_url) || Self::tile_matches(t, &entry.bundle_id, &target_url)
-        });
-        let tile = Self::app_tile(&launcher_url);
-        let replaced = match real {
-            Some(i) => {
-                apps[i] = tile;
-                true
-            }
-            None => {
-                apps.push(tile);
-                false
-            }
-        };
+        let replaced = Self::pin_tile(apps, entry, &launcher_url, &source_url, &target_url);
         self.write_dock(&original, &dock)?;
         Ok(replaced)
+    }
+
+    fn pin_tile(apps: &mut Vec<plist::Value>, entry: &Entry, launcher_url: &str, source_url: &str, target_url: &str) -> bool {
+        let id = Self::launcher_id(&entry.bundle_id);
+        let previous = apps.iter().position(|t| Self::tile_matches(t, &id, launcher_url));
+        apps.retain(|t| !Self::tile_matches(t, &id, launcher_url));
+        let real = apps.iter().position(|t| {
+            Self::tile_matches(t, &entry.bundle_id, source_url) || Self::tile_matches(t, &entry.bundle_id, target_url)
+        });
+        let tile = Self::app_tile(launcher_url);
+        match real {
+            Some(i) => apps[i] = tile,
+            None => apps.insert(previous.unwrap_or(apps.len()).min(apps.len()), tile),
+        }
+        real.is_some()
     }
 
     /// 本物を元の位置に戻す必要がなければ、Dock のタイルのメニューで外す(Dock を再起動しない)。
@@ -1198,7 +1308,8 @@ impl DockMorph {
         }
         self.edit_dock(
             |dm| dm.unpin_launcher_once(entry, anim).map(Some),
-            |apps| !apps.iter().any(|t| Self::tile_matches(t, &id, &launcher_url)),
+            |apps| !apps.iter().any(|t| Self::tile_matches(t, &id, &launcher_url))
+                && (!anim.replaced_pin || apps.iter().any(|t| Self::tile_matches(t, &entry.bundle_id, &source_url))),
         )?;
         Ok(fallback)
     }
@@ -1260,6 +1371,8 @@ impl DockMorph {
         if entries[i].animation.is_some() {
             bail!("すでにオンです: {}", entries[i].display_name());
         }
+        Self::registered_app_info(&entries[i].source_path, bundle_id)?;
+        Self::registered_app_info(&self.target_path(&entries[i])?, bundle_id)?;
         if !template.join("Contents/PlugIns/DMAnimTile.docktileplugin/Contents/MacOS/DMAnimTile").exists() {
             bail!("起動用アプリの雛形が見つかりません。DockMorph.app から起動してください: {}", template.display());
         }
@@ -1278,30 +1391,45 @@ impl DockMorph {
             format!("このアプリのデータは macOS に保護されていて({})、起動用アプリから直接起動するとアプリが自分のデータを読めなくなります。そのため本物を別に開く方式にしました。本物の起動中は Dock にタイルが 2 つ並びます", p.display())
         });
         let direct = fallback_reason.is_none();
+        let mut pinned_animation = None;
         let result = (|| {
             Self::run(Command::new("/usr/bin/ditto").arg(template).arg(&launcher))?;
             self.refresh_launcher(&entries[i], &launcher, direct)?;
-            let replaced_pin = pin && self.pin_launcher(&entries[i], &launcher)?;
+            let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+            let mut anim = Animation { launcher_path: launcher.clone(), replaced_pin: false, direct, created, auto_rejoin: true };
+            if pin {
+                let (_, mut dock) = Self::read_dock()?;
+                let source_url = Self::file_url(&entries[i].source_path)?;
+                let target_url = Self::file_url(&self.target_path(&entries[i])?)?;
+                anim.replaced_pin = Self::persistent_apps(&mut dock)?.iter().any(|tile| {
+                    Self::tile_matches(tile, bundle_id, &source_url) || Self::tile_matches(tile, bundle_id, &target_url)
+                });
+                pinned_animation = Some(anim.clone());
+                anim.replaced_pin |= self.pin_launcher(&entries[i], &launcher)?;
+                pinned_animation = Some(anim.clone());
+            }
             // 一度も起動されていないアプリは、ピン留めしただけでは Dock がプラグインを読み込まない。ピン留めのあとに
             // 一度起動すると読み込む(実測)。本物は開かずにすぐ終了する引数で起動する。
             // ピン留めしないなら、最初に開かれたときに読み込まれるので要らない(実測)
             if pin {
                 Self::run(Command::new("/usr/bin/open").args(["-W", "-g", "-n"]).arg(&launcher).args(["--args", "--dm-register"]))?;
             }
-            let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
-            let anim = Animation { launcher_path: launcher.clone(), replaced_pin, direct, created, auto_rejoin: true };
-            entries[i].animation = Some(anim.clone());
-            if let Err(e) = self.save_entries(&entries) {
-                match self.unpin_launcher(&entries[i], &anim) {
-                    Ok(Some(w)) => eprintln!("{w}"),
-                    Ok(None) => {}
-                    Err(u) => eprintln!("Dock を元に戻せません: {u:#}"),
-                }
-                return Err(e);
-            }
+            entries[i].animation = Some(anim);
+            self.save_entries(&entries)?;
             Ok(())
         })();
         if let Err(e) = result {
+            if let Some(anim) = &pinned_animation {
+                match self.unpin_launcher(&entries[i], anim) {
+                    Ok(Some(w)) => eprintln!("{w}"),
+                    Ok(None) => {}
+                    Err(u) => {
+                        entries[i].animation = Some(anim.clone());
+                        self.save_entries(&entries).context("Dock の復元に失敗し、起動用アプリの登録も保存できません")?;
+                        return Err(e).context(format!("Dock を元に戻せません。起動用アプリと登録は保持しました。「Dock で動かす」をオフにして再試行してください: {u:#}"));
+                    }
+                }
+            }
             if launcher.exists() {
                 if let Err(r) = Self::release_schemes(&entries[i], &launcher) {
                     eprintln!("既定のアプリを本物に戻せません: {r:#}");
@@ -1397,6 +1525,7 @@ impl DockMorph {
     pub fn launch(&self, bundle_id: &str) -> Result<()> {
         let entries = self.load_entries()?;
         let entry = entries.iter().find(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("未登録です: {bundle_id}"))?;
+        Self::registered_app_info(&self.target_path(entry)?, bundle_id)?;
         // Dock で動かしているときに本物を直接開くと、本物のタイルが別に出てしまう
         let target = match &entry.animation {
             Some(anim) => anim.launcher_path.clone(),
@@ -1424,5 +1553,146 @@ impl DockMorph {
             bail!("Finder で表示できません ({status}): {}", target.display());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("dockmorph-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn app(&self, id: &str, executable: &str) -> PathBuf {
+            let app = self.0.join("Sample.app");
+            fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+            fs::write(app.join("Contents/MacOS/main"), b"executable").unwrap();
+            let mut info = plist::Dictionary::new();
+            info.insert("CFBundleIdentifier".into(), id.into());
+            info.insert("CFBundleExecutable".into(), executable.into());
+            plist::Value::Dictionary(info).to_file_xml(app.join("Contents/Info.plist")).unwrap();
+            app
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(); }
+    }
+
+    #[test]
+    fn app_info_rejects_invalid_executables() {
+        let fixture = Fixture::new();
+        for executable in ["", ".", "..", "../Info.plist", "/bin/sh", "missing"] {
+            let app = fixture.app("test.sample", executable);
+            assert!(DockMorph::app_info(&app).is_err(), "{executable}");
+        }
+        let app = fixture.app("test.sample", "directory");
+        fs::create_dir(app.join("Contents/MacOS/directory")).unwrap();
+        assert!(DockMorph::app_info(&app).is_err());
+        assert_eq!(DockMorph::app_info(&fixture.app("test.sample", "main")).unwrap().bundle_id, "test.sample");
+    }
+
+    #[test]
+    fn mismatched_app_is_not_modified() {
+        let fixture = Fixture::new();
+        let source = fixture.app("test.replacement", "main");
+        let dm = DockMorph { home: fixture.0.clone(), launchers: fixture.0.join("Launchers") };
+        let mut entry = Entry {
+            mode: Mode::InPlace, bundle_id: "test.original".into(), source_path: source.clone(),
+            icon_path: fixture.0.join("missing.png"), fingerprint: "before".into(), animation: None,
+        };
+        dm.save_entries(&[entry.clone()]).unwrap();
+        assert!(dm.sync_entry(&mut entry).unwrap_err().to_string().contains("登録と異なるアプリ"));
+        assert!(dm.change_image("test.original", &fixture.0.join("missing.png")).unwrap_err().to_string().contains("登録と異なるアプリ"));
+        assert!(dm.remove("test.original").unwrap_err().to_string().contains("登録と異なるアプリ"));
+        assert!(dm.launch("test.original").unwrap_err().to_string().contains("登録と異なるアプリ"));
+        assert!(dm.enable_animation("test.original", &fixture.0, false).err().unwrap().to_string().contains("登録と異なるアプリ"));
+        assert_eq!(dm.load_entries().unwrap(), vec![entry]);
+        assert!(!source.join("Icon\r").exists());
+        assert!(DockMorph::registered_app_info(&source, "test.replacement").is_ok());
+    }
+
+    #[test]
+    fn stored_images_have_distinct_paths_and_preserve_contents() {
+        let fixture = Fixture::new();
+        let dm = DockMorph { home: fixture.0.clone(), launchers: fixture.0.join("Launchers") };
+        let image = fixture.0.join("source.png");
+        let mut stored = Vec::new();
+        for n in 0..100u32 {
+            let contents = n.to_le_bytes();
+            fs::write(&image, contents).unwrap();
+            let path = dm.store_image("test.sample", &image).unwrap();
+            assert!(!stored.iter().any(|(old, _)| old == &path), "保存パスが衝突: {}", path.display());
+            stored.push((path, contents));
+        }
+        for (path, contents) in stored {
+            assert_eq!(fs::read(path).unwrap(), contents);
+        }
+    }
+
+    #[test]
+    fn clone_failure_preserves_existing_app() {
+        let fixture = Fixture::new();
+        let source = fixture.app("test.sample", "main");
+        let dest = fixture.0.join("Apps/Sample.app");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("old-data"), b"preserved").unwrap();
+        assert!(DockMorph::make_clone(&source, &dest, &fixture.0.join("missing.png")).is_err());
+        assert_eq!(fs::read(dest.join("old-data")).unwrap(), b"preserved");
+        assert_eq!(fs::read_dir(dest.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn unsafe_bundle_id_is_rejected() {
+        let fixture = Fixture::new();
+        let dm = DockMorph { home: fixture.0.clone(), launchers: fixture.0.join("Launchers") };
+        for id in ["../escape", "/tmp/escape", "a/b", "..", "a/", "a\0b"] {
+            assert!(DockMorph::app_info(&fixture.app(id, "main")).is_err(), "{id}");
+            assert!(dm.store_image(id, &fixture.0.join("source.png")).is_err());
+        }
+        assert!(!fixture.0.join("Icons").exists());
+    }
+
+    #[test]
+    fn retrying_pin_preserves_original_position() {
+        let entry = Entry {
+            mode: Mode::InPlace, bundle_id: "test.sample".into(), source_path: "/Sample.app".into(),
+            icon_path: "/icon.png".into(), fingerprint: "1".into(), animation: None,
+        };
+        let before = DockMorph::app_tile("file:///Before.app/");
+        let after = DockMorph::app_tile("file:///After.app/");
+        let mut apps = vec![before.clone(), DockMorph::app_tile("file:///Sample.app/"), after.clone()];
+        assert!(DockMorph::pin_tile(&mut apps, &entry, "file:///Launcher.app/", "file:///Sample.app/", "file:///Sample.app/"));
+        assert!(!DockMorph::pin_tile(&mut apps, &entry, "file:///Launcher.app/", "file:///Sample.app/", "file:///Sample.app/"));
+        assert_eq!(apps, vec![before, DockMorph::app_tile("file:///Launcher.app/"), after]);
+    }
+
+    #[test]
+    fn sync_does_not_replace_an_unrelated_clone() {
+        let fixture = Fixture::new();
+        let source = fixture.app("test.original", "main");
+        let dm = DockMorph { home: fixture.0.clone(), launchers: fixture.0.join("Launchers") };
+        let mut entry = Entry {
+            mode: Mode::Clone, bundle_id: "test.original".into(), source_path: source,
+            icon_path: fixture.0.join("missing.png"), fingerprint: "old".into(), animation: None,
+        };
+        let clone = dm.clone_path(&entry).unwrap();
+        fs::create_dir_all(clone.join("Contents/MacOS")).unwrap();
+        fs::write(clone.join("Contents/MacOS/main"), b"unrelated").unwrap();
+        let mut info = plist::Dictionary::new();
+        info.insert("CFBundleIdentifier".into(), "test.unrelated".into());
+        info.insert("CFBundleExecutable".into(), "main".into());
+        plist::Value::Dictionary(info).to_file_xml(clone.join("Contents/Info.plist")).unwrap();
+        assert!(dm.sync_entry(&mut entry).unwrap_err().to_string().contains("登録と異なるアプリ"));
+        assert_eq!(fs::read(clone.join("Contents/MacOS/main")).unwrap(), b"unrelated");
     }
 }

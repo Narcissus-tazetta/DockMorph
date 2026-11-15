@@ -1,3 +1,4 @@
+use crate::icon_guard::{self, Process};
 use dockmorph_core::{DockMorph, Entry, SyncResult, TileState};
 use gpui::{AppContext, Context, SharedString};
 use std::collections::HashMap;
@@ -9,6 +10,7 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const BANNER_TIMEOUT: Duration = Duration::from_secs(4);
 // 本物が直接開かれたのを見つける間隔。起動中のアプリの一覧と、対象アプリのプロセス情報を読むだけ
 const AUTO_REJOIN_INTERVAL: Duration = Duration::from_secs(2);
+const ICON_GUARD_FAILURE: &str = "Antigravity の起動中のアイコンを保持できません";
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Level {
@@ -65,6 +67,11 @@ pub struct Store {
     pub busy_job: DockJob,
     /// 自動で開き直したプロセス。開き直しても本物が直接開かれ続ける場合に、終了と起動を繰り返さないため
     auto_rejoined: HashMap<String, (i32, std::time::Instant)>,
+    icon_guard_target: Option<Process>,
+    icon_guard_current: Option<Process>,
+    icon_guard_attempted: bool,
+    icon_guard_busy: bool,
+    icon_guard_issue: Option<SharedString>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -77,8 +84,12 @@ pub enum DockJob {
 impl Store {
     /// 同期の定期実行はウィンドウではなくこのエンティティに持たせる。ウィンドウを閉じてメニューバーに常駐している間も止めないため
     pub fn new(dm: DockMorph, cx: &mut Context<Self>) -> Self {
-        let mut store =
-            Store { dm, items: vec![], banner: None, last_sync: None, issues: HashMap::new(), banner_seq: 0, ax_trusted: DockMorph::accessibility_trusted(), busy: None, busy_job: DockJob::Animation, auto_rejoined: HashMap::new() };
+        let mut store = Store {
+            dm, items: vec![], banner: None, last_sync: None, issues: HashMap::new(), banner_seq: 0,
+            ax_trusted: DockMorph::accessibility_trusted(), busy: None, busy_job: DockJob::Animation,
+            auto_rejoined: HashMap::new(), icon_guard_target: None, icon_guard_current: None,
+            icon_guard_attempted: false, icon_guard_busy: false, icon_guard_issue: None,
+        };
         store.upgrade_launchers(cx);
         store.sync(false, cx);
         cx.spawn(async move |this, cx| loop {
@@ -114,7 +125,14 @@ impl Store {
         if changed {
             cx.notify();
         }
-        let found = self.items.iter().find_map(|i| Some((i.entry.bundle_id.clone(), self.dm.just_launched_outside(&i.entry)?)));
+        self.update_icon_guard(cx);
+        let found = self.items.iter().find_map(|i| {
+            let pid = self.dm.just_launched_outside(&i.entry)?;
+            if self.auto_rejoined.get(&i.entry.bundle_id).is_some_and(|(previous, _)| *previous == pid) {
+                return None;
+            }
+            Some((i.entry.bundle_id.clone(), pid))
+        });
         let Some((id, pid)) = found else { return };
         let now = std::time::Instant::now();
         match self.auto_rejoined.insert(id.clone(), (pid, now)) {
@@ -135,12 +153,60 @@ impl Store {
         self.rejoin(&id, cx);
     }
 
+    fn update_icon_guard(&mut self, cx: &mut Context<Self>) {
+        if self.icon_guard_busy {
+            return;
+        }
+        let desired = self.items.iter().find(|i| i.entry.bundle_id == icon_guard::BUNDLE_ID && i.tile == Some(TileState::Joined)).and_then(|i| {
+            let (pid, started) = self.dm.running_process(&i.entry)?;
+            Some(Process { pid, started, bundle: self.dm.target_path(&i.entry).ok()?, registry: self.dm.entries_file() })
+        });
+        if desired == self.icon_guard_target && (self.icon_guard_attempted || (desired.is_none() && self.icon_guard_current.is_none())) {
+            return;
+        }
+        let previous = self.icon_guard_current.clone().filter(|p| Some(p) != desired.as_ref());
+        self.icon_guard_target = desired.clone();
+        self.icon_guard_attempted = true;
+        self.icon_guard_busy = true;
+        let completed_target = desired.clone();
+        let task = cx.background_spawn(async move {
+            if let Some(previous) = previous {
+                icon_guard::update(&previous, true)?;
+            }
+            if let Some(desired) = desired {
+                icon_guard::update(&desired, false)?;
+            }
+            anyhow::Ok(())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.icon_guard_busy = false;
+                let had_issue = this.icon_guard_issue.is_some();
+                if result.is_ok() {
+                    this.icon_guard_current = completed_target;
+                }
+                this.icon_guard_issue = result.as_ref().err().map(|e| format!("起動中のアイコン上書きを抑止できません: {e:#}。「今すぐ同期」で再試行できます").into());
+                if let Err(e) = result {
+                    this.notify(Level::Warn, ICON_GUARD_FAILURE, Some(format!("{e:#}")), cx);
+                } else if had_issue && this.banner.as_ref().is_some_and(|b| b.title.as_ref() == ICON_GUARD_FAILURE) {
+                    this.notify(Level::Success, "Antigravity の起動中のアイコンを保持しています", None, cx);
+                }
+                this.reload(cx);
+            }).ok();
+        }).detach();
+    }
+
     pub fn request_accessibility(&mut self, cx: &mut Context<Self>) {
         self.ax_trusted = DockMorph::request_accessibility();
         cx.notify();
     }
 
     pub fn set_auto_rejoin(&mut self, bundle_id: &str, on: bool, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            self.notify(Level::Info, "Dock の更新中です", Some("完了してから操作してください".into()), cx);
+            return ;
+        }
         let result = self.dm.set_auto_rejoin(bundle_id, on);
         self.reload(cx);
         if let Err(e) = result {
@@ -195,7 +261,7 @@ impl Store {
                         applied: self.dm.is_applied(&entry),
                         dock_stale,
                         tile: self.dm.tile_state(&entry),
-                        issue: self.issues.get(&entry.bundle_id).cloned(),
+                        issue: self.issues.get(&entry.bundle_id).cloned().or_else(|| (entry.bundle_id == icon_guard::BUNDLE_ID).then(|| self.icon_guard_issue.clone()).flatten()),
                         entry,
                     })
                     .collect();
@@ -207,6 +273,15 @@ impl Store {
 
     /// 手動実行は結果を必ず表示する。定期実行は前回から変化があったときだけ表示する(同じ失敗を 30 秒ごとに出し直さない)
     pub fn sync(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            if manual {
+                self.notify(Level::Info, "Dock の更新中です", Some("完了してから同期してください".into()), cx);
+            }
+            return;
+        }
+        if manual {
+            self.icon_guard_attempted = false;
+        }
         let results = match self.dm.sync() {
             Ok(r) => r,
             Err(e) => {
@@ -249,6 +324,8 @@ impl Store {
             self.notify(Level::Success, "アイコンを付け直しました", Some(format!("{names}(アップデートなどで外れていました)")), cx);
         } else if !moved.is_empty() {
             self.notify(Level::Info, "移動されたアプリに追従しました", Some(moved.join("\n")), cx);
+        } else if manual && self.icon_guard_issue.is_some() {
+            self.notify(Level::Info, "起動中のアイコン制御を再試行します", None, cx);
         } else if manual {
             self.notify(Level::Success, "すべて最新です", None, cx);
         }
@@ -256,6 +333,10 @@ impl Store {
 
     /// 成功したら追加した bundle ID を返す
     pub fn add(&mut self, app: &Path, image: &Path, cx: &mut Context<Self>) -> Option<String> {
+        if self.busy.is_some() {
+            self.notify(Level::Info, "Dock の更新中です", Some("完了してから操作してください".into()), cx);
+            return None;
+        }
         let result = self.dm.add(app, image, false);
         self.reload(cx);
         match result {
@@ -286,6 +367,10 @@ impl Store {
     }
 
     pub fn change_image(&mut self, bundle_id: &str, image: &Path, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            self.notify(Level::Info, "Dock の更新中です", Some("完了してから操作してください".into()), cx);
+            return ;
+        }
         let name = self.item(bundle_id).map(|i| i.name.to_string()).unwrap_or_else(|| bundle_id.to_string());
         let result = self.dm.change_image(bundle_id, image);
         self.reload(cx);
@@ -419,6 +504,10 @@ impl Store {
     }
 
     pub fn remove(&mut self, bundle_id: &str, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            self.notify(Level::Info, "Dock の更新中です", Some("完了してから操作してください".into()), cx);
+            return ;
+        }
         let name = self.item(bundle_id).map(|i| i.name.to_string()).unwrap_or_else(|| bundle_id.to_string());
         let id = bundle_id.to_string();
         let done = move |this: &mut Self, result: anyhow::Result<Option<String>>, cx: &mut Context<Self>| match result {
@@ -436,6 +525,10 @@ impl Store {
     }
 
     pub fn launch(&mut self, bundle_id: &str, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            self.notify(Level::Info, "Dock の更新中です", Some("完了してから操作してください".into()), cx);
+            return ;
+        }
         if let Err(e) = self.dm.launch(bundle_id) {
             return self.notify(Level::Error, "起動できません", Some(format!("{e:#}")), cx);
         }

@@ -26,6 +26,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 mkdir -p "$app/Contents/Resources"
+swiftc -O -parse-as-library -o "$app/Contents/Resources/DMIconGuard" crates/app/helpers/IconGuard.swift
 iconset=$(mktemp -d)/AppIcon.iconset
 swift scripts/icon.swift crates/app/assets/menubar.svg "$iconset"
 iconutil -c icns -o "$app/Contents/Resources/AppIcon.icns" "$iconset"

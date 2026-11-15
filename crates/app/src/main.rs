@@ -1,5 +1,6 @@
 mod assets;
 mod gif;
+mod icon_guard;
 mod login;
 mod menubar;
 mod panel;

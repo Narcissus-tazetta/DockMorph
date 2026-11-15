@@ -72,7 +72,11 @@ final class DMAnimTilePlugin: NSObject, NSDockTilePlugIn {
     private func step(_ gen: Int) {
         guard gen == generation, let tile else { return }
         if index == 0 { reloadIfChanged() }
-        guard let frames else { return }
+        guard let frames else {
+            // 起動時に画像がまだ読めなくても、後から配置・修復された画像を拾い直す。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.step(gen) }
+            return
+        }
         view.image = frames.images[index]
         tile.display()
         let delay = frames.delays[index]

@@ -3,7 +3,8 @@ use crate::gif::Gifs;
 use crate::store::{clock, DockJob, Item, Level, Store};
 use crate::theme::Theme;
 use crate::{AddApp, CloseWindow, SyncNow};
-use dockmorph_core::{Mode, TileState};
+use dockmorph_core::{DockMorph, Mode, TileState};
+use std::sync::Arc;
 use gpui::{
     div, img, linear_color_stop, linear_gradient, prelude::*, px, svg, AnyElement, BoxShadow, ClickEvent, Context, Div,
     ElementId, Entity, ExternalPaths, FocusHandle, FontWeight, Hsla, PathPromptOptions, Pixels, PromptButton, PromptLevel, SharedString, Stateful,
@@ -39,6 +40,7 @@ pub struct MainView {
     store: Entity<Store>,
     pane: Pane,
     pending_app: Option<PathBuf>,
+    pending_app_icon: Option<Arc<gpui::Image>>,
     pending_image: Option<PathBuf>,
     /// ファイル選択パネルは開いている間もウィンドウのクリックを受け付けるので、二重に開かないようにする
     picking: bool,
@@ -64,7 +66,7 @@ impl MainView {
         let pane = Self::default_pane(store.read(cx));
         let focus = cx.focus_handle();
         window.focus(&focus);
-        MainView { store, pane, pending_app: None, pending_image: None, picking: false, gifs: Gifs::new(), focus, _subscriptions: subscriptions }
+        MainView { store, pane, pending_app: None, pending_app_icon: None, pending_image: None, picking: false, gifs: Gifs::new(), focus, _subscriptions: subscriptions }
     }
 
     /// 登録画像のプレビュー。GIF は gpui に任せず自前でコマを選ぶ(gif.rs)
@@ -92,6 +94,13 @@ impl MainView {
     fn accept_app(&mut self, path: &Path, cx: &mut Context<Self>) {
         if path.extension().and_then(|e| e.to_str()) == Some("app") && path.is_dir() {
             self.pending_app = Some(path.to_path_buf());
+            self.pending_app_icon = match DockMorph::app_icon_png(path) {
+                Ok(png) => Some(Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png))),
+                Err(e) => {
+                    self.notify_error("アプリのアイコンを表示できません", format!("{e:#}"), cx);
+                    None
+                }
+            };
         } else {
             self.notify_error("アプリ(.app)ではありません", path.display().to_string(), cx);
         }
@@ -143,12 +152,11 @@ impl MainView {
             return;
         }
         self.picking = true;
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some(if target == PickFor::App { "アプリを選択" } else { "画像を選択" }.into()),
-        });
+        let rx = if target == PickFor::App {
+            crate::panel::pick_file("アプリを選択", Path::new("/Applications"))
+        } else {
+            cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("画像を選択".into()) })
+        };
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             this.update(cx, |this, cx| {
@@ -204,6 +212,7 @@ impl MainView {
         let (Some(app), Some(image)) = (self.pending_app.clone(), self.pending_image.clone()) else { return };
         if let Some(id) = self.store.update(cx, |s, cx| s.add(&app, &image, cx)) {
             self.pending_app = None;
+            self.pending_app_icon = None;
             self.pending_image = None;
             self.pane = Pane::Entry(id);
         }
@@ -787,6 +796,10 @@ impl MainView {
         let filled = path.is_some();
         let preview: AnyElement = match (&path, for_app) {
             (Some(p), false) => self.picture(p, "pending-icon", 72., 16., cx),
+            (Some(_), true) if self.pending_app_icon.is_some() => {
+                let icon = self.pending_app_icon.clone().expect("is_some で確認済み");
+                img(icon).id("pending-app-icon").size(px(72.)).flex_none().into_any_element()
+            }
             _ => tile(empty_icon, tint, 56.).into_any_element(),
         };
         let accent = t.accent;

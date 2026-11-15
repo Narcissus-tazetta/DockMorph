@@ -8,10 +8,10 @@ anyhow = "1"
 block2 = "0.6"
 libc = "0.2"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSImage", "NSRunningApplication", "NSGraphics", "block2"] }
+objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSImage", "NSRunningApplication", "NSGraphics", "NSBitmapImageRep", "NSImageRep", "block2"] }
 objc2-application-services = { version = "0.3.2", features = ["HIServices", "AXUIElement", "AXError"] }
 objc2-core-foundation = { version = "0.3.2", features = ["CFArray", "CFString", "CFURL", "CFBase"] }
-objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSDate", "NSGeometry", "NSError"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSDate", "NSGeometry", "NSError", "NSData", "NSDictionary"] }
 plist = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

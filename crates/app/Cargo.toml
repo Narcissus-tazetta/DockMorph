@@ -6,12 +6,13 @@ version.workspace = true
 [dependencies]
 anyhow = "1"
 dockmorph-core = { path = "../core" }
+block2 = "0.6"
 futures = "0.3"
 gpui = "0.2"
 # gpui が RenderImage に使う image::Frame と同じ版にする(0.25 で揃える)
 image = "0.25"
 libc = "0.2"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSRunningApplication", "NSResponder", "NSImage", "NSMenu", "NSMenuItem", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSCell"] }
-objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSGeometry", "NSError"] }
+objc2-app-kit = { version = "0.3", features = ["NSOpenPanel", "NSSavePanel", "NSPanel", "NSWindow", "block2", "NSApplication", "NSRunningApplication", "NSResponder", "NSImage", "NSMenu", "NSMenuItem", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSCell"] }
+objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSGeometry", "NSError", "NSArray", "NSURL", "NSThread"] }
 objc2-service-management = { version = "0.3", features = ["SMAppService"] }

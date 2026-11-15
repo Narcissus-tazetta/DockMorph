@@ -2,6 +2,7 @@ mod assets;
 mod gif;
 mod login;
 mod menubar;
+mod panel;
 mod store;
 mod theme;
 mod ui;

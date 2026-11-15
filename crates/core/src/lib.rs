@@ -2,9 +2,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use objc2::rc::Retained;
 use objc2::runtime::Bool;
 use objc2::AllocAnyThread;
-use objc2_app_kit::{NSCompositingOperation, NSImage, NSRunningApplication, NSWorkspace, NSWorkspaceIconCreationOptions};
+use objc2_app_kit::{NSBitmapImageRep, NSBitmapImageFileType, NSCompositingOperation, NSImage, NSRunningApplication, NSWorkspace, NSWorkspaceIconCreationOptions};
 use block2::RcBlock;
-use objc2_foundation::{NSError, NSPoint, NSRect, NSSize, NSString, NSURL};
+use objc2_foundation::{NSDictionary, NSError, NSPoint, NSRect, NSSize, NSString, NSURL};
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::fs;
@@ -590,6 +590,29 @@ impl DockMorph {
             bail!("アイコンの解除に失敗: {}", app.display());
         }
         Ok(())
+    }
+
+    /// 追加画面のプレビュー用に、アプリが今 OS に見せているアイコンを 256px の PNG にする。
+    /// 登録済みのアプリなら付けたカスタム画像が返る
+    pub fn app_icon_png(app: &Path) -> Result<Vec<u8>> {
+        let side = 256.;
+        let source = NSWorkspace::sharedWorkspace().iconForFile(&NSString::from_str(&app.to_string_lossy()));
+        // TIFFRepresentation は全解像度を含み、そのまま読むと最小の 16px が先頭に来ることがある。1 枚に描き直してから書き出す
+        let handler = RcBlock::new(move |_: NSRect| {
+            source.drawInRect_fromRect_operation_fraction(
+                NSRect::new(NSPoint::ZERO, NSSize::new(side, side)),
+                NSRect::ZERO,
+                NSCompositingOperation::SourceOver,
+                1.0,
+            );
+            Bool::YES
+        });
+        let flat = NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(side, side), false, &handler);
+        let tiff = flat.TIFFRepresentation().ok_or_else(|| anyhow!("アイコンを書き出せません: {}", app.display()))?;
+        let rep = NSBitmapImageRep::imageRepWithData(&tiff).ok_or_else(|| anyhow!("アイコンを読み直せません: {}", app.display()))?;
+        let png = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) }
+            .ok_or_else(|| anyhow!("アイコンを PNG にできません: {}", app.display()))?;
+        Ok(png.to_vec())
     }
 
     /// FinderInfo の kHasCustomIcon ビット(8バイト目の 0x04)。アプリ更新でバンドルが差し替わると消える

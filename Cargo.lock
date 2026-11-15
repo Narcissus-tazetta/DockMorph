@@ -1402,6 +1402,7 @@ name = "dockmorph-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "block2",
  "dockmorph-core",
  "futures",
  "gpui",

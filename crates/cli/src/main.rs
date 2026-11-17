@@ -1,27 +1,27 @@
 use anyhow::{bail, Result};
-use dockmorph_core::{DockMorph, Mode, SyncResult, TileState};
+use dockmorph_core::{lang, tr, DockMorph, Mode, SyncResult, TileState};
 use std::path::PathBuf;
 
 const USAGE: &str = "usage:
   dockmorph add [--clone] <App.app> <image>
-                                    本物にアイコンを付ける。書き込めなければクローンに切り替える(--clone でクローン固定)
-  dockmorph list                    登録とアイコンの場所を表示
-  dockmorph sync                    元アプリの更新を検知して付け直す・作り直す
+                                    attach the icon to the real app; fall back to a clone if it is not writable (--clone forces a clone)
+  dockmorph list                    show registrations and icon locations
+  dockmorph sync                    detect app updates and reapply or rebuild icons
   dockmorph set-image <bundle-id> <image>
-                                    登録済みのアプリの画像を差し替える
+                                    replace the image of a registered app
   dockmorph animate <bundle-id> on <Launcher.app> [--no-pin]
   dockmorph animate <bundle-id> off
-                                    Dock で画像を動かす(実験的)。起動用アプリを作って Dock にピン留めする。
-                                    本物のピン留めの位置を置き換えるときだけ Dock が再起動する。
-                                    --no-pin ならピン留めせず、起動用アプリから開いたときだけ Dock の右側で動く。
-                                    Launcher.app は DockMorph.app/Contents/Resources にある雛形
-  dockmorph rejoin <bundle-id>      本物のタイルが別に出ているとき、アプリを再起動して動くタイル 1 つに戻す
-  dockmorph clear-leftovers         動くタイルのアプリの、Dock に残った本物のタイル(起動していないもの)を消す
+                                    animate the image in the Dock (experimental). Creates a launcher app and pins it to the Dock.
+                                    The Dock restarts only when the real app's pin is replaced.
+                                    With --no-pin nothing is pinned; the tile animates on the right side of the Dock only while the app runs from the launcher.
+                                    Launcher.app is the template in DockMorph.app/Contents/Resources
+  dockmorph rejoin <bundle-id>      when the real app's tile appears separately, restart the app and return to one animated tile
+  dockmorph clear-leftovers         remove leftover real-app tiles (not running) of animated apps from the Dock
   dockmorph upgrade-launchers <Launcher.app>
-                                    作成済みの起動用アプリを新しい雛形に入れ替える
-  dockmorph refresh-dock            Dock が覚えているアイコンを消して Dock を再起動する(アプリは終了しない)
-  dockmorph launch <bundle-id>      起動
-  dockmorph remove <bundle-id>      アイコンを戻し、登録を削除";
+                                    replace existing launcher apps with the new template
+  dockmorph refresh-dock            clear the icons the Dock remembers and restart the Dock (apps keep running)
+  dockmorph launch <bundle-id>      launch
+  dockmorph remove <bundle-id>      restore the icon and delete the registration";
 
 fn main() -> Result<()> {
     // Rust は SIGPIPE を無視するので、`list | head` で読み手が先に閉じると println! が panic する。
@@ -29,6 +29,11 @@ fn main() -> Result<()> {
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dm = DockMorph::new()?;
+    // 設定ファイルが壊れていても、アイコンを戻す操作はできるようにする
+    match dm.settings() {
+        Ok(settings) => lang::set(settings.language),
+        Err(e) => eprintln!("warning: {e:#}"),
+    }
     match args.first().map(String::as_str) {
         Some("add") => {
             let force_clone = args.iter().any(|a| a == "--clone");
@@ -38,7 +43,7 @@ fn main() -> Result<()> {
             }
             let r = dm.add(&PathBuf::from(paths[0]), &PathBuf::from(paths[1]), force_clone)?;
             if let Some(reason) = &r.fallback_reason {
-                eprintln!("warning: 本物に書き込めなかったためクローン方式に切り替えました: {reason}");
+                eprintln!("warning: could not write to the real app, so switched to the clone method: {reason}");
             }
             let mode = if r.entry.mode == Mode::InPlace { "inPlace" } else { "clone" };
             println!("added {} [{mode}]", r.entry.bundle_id);
@@ -53,8 +58,8 @@ fn main() -> Result<()> {
                 let anim = match dm.tile_state(&e) {
                     None => "",
                     Some(TileState::NotRunning) => "\tanimated",
-                    Some(TileState::Joined) => "\tanimated (起動中・タイル 1 つ)",
-                    Some(TileState::Split) => "\tanimated (起動中・本物のタイルが別に出ている)",
+                    Some(TileState::Joined) => tr("\tanimated (起動中・タイル 1 つ)", "\tanimated (running, single tile)"),
+                    Some(TileState::Split) => tr("\tanimated (起動中・本物のタイルが別に出ている)", "\tanimated (running, the real app's tile is separate)"),
                 };
                 println!("{}\t{mode}\t{state}\t{}{anim}", e.bundle_id, dm.target_path(&e)?.display());
             }
@@ -82,7 +87,7 @@ fn main() -> Result<()> {
             let e = dm.change_image(&args[1], &PathBuf::from(&args[2]))?;
             println!("changed {} → {}", e.bundle_id, e.icon_path.display());
             if dm.dock_stale(std::slice::from_ref(&e)) == [true] {
-                println!("note: Dock は前のアイコンを覚えています。refresh-dock で反映されます");
+                println!("note: the Dock remembers the old icon. Apply it with refresh-dock");
             }
         }
         Some("animate") if (args.len() == 4 || (args.len() == 5 && args[4] == "--no-pin")) && args[2] == "on" => {
@@ -95,7 +100,7 @@ fn main() -> Result<()> {
             }
             if let Some(a) = &r.entry.animation {
                 let mode = if a.direct { "direct" } else { "separate" };
-                println!("animated {} → {} [{mode}]{}", r.entry.bundle_id, a.launcher_path.display(), if a.replaced_pin { " (ピン留めを置き換え)" } else { "" });
+                println!("animated {} → {} [{mode}]{}", r.entry.bundle_id, a.launcher_path.display(), if a.replaced_pin { tr(" (ピン留めを置き換え)", " (replaced the pin)") } else { "" });
             }
         }
         Some("animate") if args.len() == 3 && args[2] == "off" => {

@@ -1,3 +1,4 @@
+use dockmorph_core::{l};
 use anyhow::{anyhow, Result};
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
 
@@ -20,13 +21,13 @@ pub enum Outcome {
 }
 
 pub fn toggle() -> Result<Outcome> {
-    let s = service().ok_or_else(|| anyhow!("DockMorph.app として起動したときだけ設定できます"))?;
+    let s = service().ok_or_else(|| anyhow!("{}", l!("DockMorph.app として起動したときだけ設定できます", "Available only when launched as DockMorph.app")))?;
     let status = unsafe { s.status() };
     if status == SMAppServiceStatus::Enabled || status == SMAppServiceStatus::RequiresApproval {
-        unsafe { s.unregisterAndReturnError() }.map_err(|e| anyhow!("ログイン項目から外せません: {}", e.localizedDescription()))?;
+        unsafe { s.unregisterAndReturnError() }.map_err(|e| anyhow!("{}", l!("ログイン項目から外せません: {}", "Cannot remove from Login Items: {}", e.localizedDescription())))?;
         return Ok(Outcome::Disabled);
     }
-    unsafe { s.registerAndReturnError() }.map_err(|e| anyhow!("ログイン項目に登録できません: {}", e.localizedDescription()))?;
+    unsafe { s.registerAndReturnError() }.map_err(|e| anyhow!("{}", l!("ログイン項目に登録できません: {}", "Cannot add to Login Items: {}", e.localizedDescription())))?;
     if unsafe { s.status() } == SMAppServiceStatus::RequiresApproval {
         unsafe { SMAppService::openSystemSettingsLoginItems() };
         return Ok(Outcome::NeedsApproval);

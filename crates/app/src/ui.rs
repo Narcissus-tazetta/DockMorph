@@ -1,12 +1,14 @@
+use dockmorph_core::{l, lang, tr, DockMorph, Language, Mode, TileState};
 use crate::assets::icon;
 use crate::gif::Gifs;
 use crate::store::{clock, DockJob, Item, Level, Store};
 use crate::theme::Theme;
+use crate::{login, updater};
 use crate::{AddApp, CloseWindow, SyncNow};
-use dockmorph_core::{DockMorph, Mode, TileState};
+
 use std::sync::Arc;
 use gpui::{
-    div, img, linear_color_stop, linear_gradient, prelude::*, px, svg, AnyElement, BoxShadow, ClickEvent, Context, Div,
+    deferred, div, img, linear_color_stop, linear_gradient, prelude::*, px, svg, AnyElement, BoxShadow, ClickEvent, Context, MouseDownEvent, Div,
     ElementId, Entity, ExternalPaths, FocusHandle, FontWeight, Hsla, PathPromptOptions, Pixels, PromptButton, PromptLevel, SharedString, Stateful,
     Subscription, Window, point,
 };
@@ -33,6 +35,7 @@ fn is_image(path: &Path) -> bool {
 #[derive(Clone, PartialEq)]
 enum Pane {
     Add,
+    Settings,
     Entry(String),
 }
 
@@ -44,6 +47,7 @@ pub struct MainView {
     pending_image: Option<PathBuf>,
     /// ファイル選択パネルは開いている間もウィンドウのクリックを受け付けるので、二重に開かないようにする
     picking: bool,
+    language_menu_open: bool,
     gifs: Gifs,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -66,7 +70,7 @@ impl MainView {
         let pane = Self::default_pane(store.read(cx));
         let focus = cx.focus_handle();
         window.focus(&focus);
-        MainView { store, pane, pending_app: None, pending_app_icon: None, pending_image: None, picking: false, gifs: Gifs::new(), focus, _subscriptions: subscriptions }
+        MainView { store, pane, pending_app: None, pending_app_icon: None, pending_image: None, picking: false, language_menu_open: false, gifs: Gifs::new(), focus, _subscriptions: subscriptions }
     }
 
     /// 登録画像のプレビュー。GIF は gpui に任せず自前でコマを選ぶ(gif.rs)
@@ -79,6 +83,11 @@ impl MainView {
 
     fn default_pane(store: &Store) -> Pane {
         store.items.first().map(|i| Pane::Entry(i.entry.bundle_id.clone())).unwrap_or(Pane::Add)
+    }
+
+    pub fn show_settings(&mut self, cx: &mut Context<Self>) {
+        self.pane = Pane::Settings;
+        cx.notify();
     }
 
     pub fn show_add(&mut self, cx: &mut Context<Self>) {
@@ -97,19 +106,19 @@ impl MainView {
             self.pending_app_icon = match DockMorph::app_icon_png(path) {
                 Ok(png) => Some(Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png))),
                 Err(e) => {
-                    self.notify_error("アプリのアイコンを表示できません", format!("{e:#}"), cx);
+                    self.notify_error(tr("アプリのアイコンを表示できません", "Cannot show the app icon"), format!("{e:#}"), cx);
                     None
                 }
             };
         } else {
-            self.notify_error("アプリ(.app)ではありません", path.display().to_string(), cx);
+            self.notify_error(tr("アプリ(.app)ではありません", "Not an app (.app)"), path.display().to_string(), cx);
         }
     }
 
     fn check_image(&self, path: &Path, cx: &mut Context<Self>) -> bool {
         let ok = is_image(path);
         if !ok {
-            self.notify_error("対応していない画像形式です", format!("png / jpg / webp / gif を選んでください: {}", path.display()), cx);
+            self.notify_error(tr("対応していない画像形式です", "Unsupported image format"), l!("png / jpg / webp / gif を選んでください: {}", "Choose png / jpg / webp / gif: {}", path.display()), cx);
         }
         ok
     }
@@ -123,7 +132,7 @@ impl MainView {
     fn change_image(&mut self, path: &Path, cx: &mut Context<Self>) {
         let Pane::Entry(id) = self.pane.clone() else { return };
         if self.store.read(cx).busy.is_some() {
-            return self.notify_error("Dock の更新中です", "終わってから画像を変えてください".into(), cx);
+            return self.notify_error(tr("Dock の更新中です", "The Dock is being updated"), tr("終わってから画像を変えてください", "Change the image after it finishes").into(), cx);
         }
         if self.check_image(path, cx) {
             self.store.update(cx, |s, cx| s.change_image(&id, path, cx));
@@ -153,9 +162,9 @@ impl MainView {
         }
         self.picking = true;
         let rx = if target == PickFor::App {
-            crate::panel::pick_file("アプリを選択", Path::new("/Applications"))
+            crate::panel::pick_file(tr("アプリを選択", "Choose App"), Path::new("/Applications"))
         } else {
-            cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("画像を選択".into()) })
+            cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some(tr("画像を選択", "Choose Image").into()) })
         };
         cx.spawn(async move |this, cx| {
             let result = rx.await;
@@ -172,8 +181,8 @@ impl MainView {
                         }
                     }
                     Ok(Ok(None)) => {}
-                    Ok(Err(e)) => this.notify_error("ファイルを選べません", format!("{e:#}"), cx),
-                    Err(e) => this.notify_error("ファイル選択が中断されました", e.to_string(), cx),
+                    Ok(Err(e)) => this.notify_error(tr("ファイルを選べません", "Cannot choose a file"), format!("{e:#}"), cx),
+                    Err(e) => this.notify_error(tr("ファイル選択が中断されました", "File selection was interrupted"), e.to_string(), cx),
                 }
                 cx.notify();
             })
@@ -185,8 +194,8 @@ impl MainView {
     fn confirm_animation(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let answer = window.prompt(
             PromptLevel::Warning,
-            "Dock で画像を動かしますか?(実験的)",
-            Some(
+            tr("Dock で画像を動かしますか?(実験的)", "Animate the image in the Dock? (experimental)"),
+            Some(tr(
                 "動くタイルを表示する小さな起動用アプリを作ります。起動用アプリから開けば、起動中もタイルは 1 つのまま動きます。\n\n\
                  「Dock に置く」: 起動用アプリを Dock にピン留めします。このアプリがピン留めされていれば、その位置を置き換えます。\
                  設定のとき Dock が一瞬消えて再起動します(変更前の Dock の設定は保存します)。\
@@ -194,8 +203,15 @@ impl MainView {
                  「Dock に置かない」: Dock の並びは変えません。Spotlight・Raycast・この画面から起動用アプリを開くと、起動中だけ Dock の右側で動きます\n\n\
                  ・本物を直接開いたときや、起動後に Dock が再起動したときは、本物のタイル(静止画)が別に出ます。この画面の「まとめ直す」で戻せます\n\
                  ・データが macOS に保護されているアプリ(Firefox など)は、本物を別に開く方式になり、起動中はタイルが 2 つ並びます",
-            ),
-            &[PromptButton::ok("Dock に置く"), PromptButton::new("Dock に置かない"), PromptButton::cancel("キャンセル")],
+                "DockMorph creates a small launcher app that shows the animated tile. If you open the app from the launcher, the tile stays single and animated while the app runs.\n\n\
+                 \"Place in Dock\": pins the launcher app to the Dock. If this app is pinned, the launcher replaces it in the same position. \
+                 The Dock disappears briefly and restarts while this is set up (the Dock settings are saved beforehand). \
+                 If another animated tile is running, the launcher is placed without restarting the Dock so that tile does not split (the tile stays on the right side until the Dock next restarts).\n\n\
+                 \"Don't Place in Dock\": leaves the Dock layout alone. If you open the launcher app from Spotlight, Raycast, or this window, it animates on the right side of the Dock only while the app runs.\n\n\
+                 · If the real app is opened directly, or the Dock restarts after it launched, the real tile (still image) appears separately. \"Rejoin\" in this window restores it.\n\
+                 · Apps whose data is protected by macOS (such as Firefox) are opened separately, so two tiles appear while they run.",
+            )),
+            &[PromptButton::ok(tr("Dock に置く", "Place in Dock")), PromptButton::new(tr("Dock に置かない", "Don't Place in Dock")), PromptButton::cancel(tr("キャンセル", "Cancel"))],
             cx,
         );
         cx.spawn(async move |this, cx| {
@@ -353,6 +369,38 @@ fn kv_row(key: &str, value: impl Into<SharedString>, t: &Theme) -> AnyElement {
         .into_any_element()
 }
 
+/// 行の右端に操作部品(スイッチやボタン)を置く
+fn with_control(row: AnyElement, control: impl IntoElement) -> AnyElement {
+    div().flex().items_center().gap(px(12.)).child(div().flex_1().min_w_0().child(row)).child(control).into_any_element()
+}
+
+fn plain_row(title: &str, detail: impl Into<SharedString>, t: &Theme) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .min_w_0()
+        .child(div().text_size(px(13.)).child(title.to_string()))
+        .child(div().text_size(px(11.)).text_color(t.text2).child(detail.into()))
+        .into_any_element()
+}
+
+fn switch(id: impl Into<ElementId>, on: bool, t: &Theme) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .w(px(38.))
+        .h(px(22.))
+        .p(px(2.))
+        .rounded_full()
+        .cursor_pointer()
+        .bg(if on { t.green } else { t.text3 })
+        .when(on, |d| d.justify_end())
+        .child(div().size(px(18.)).rounded_full().bg(gpui::white()))
+}
+
 fn file_name(p: &Path) -> SharedString {
     p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default().into()
 }
@@ -400,8 +448,8 @@ impl MainView {
                             .min_w_0()
                             .child(div().text_size(px(13.)).truncate().child(item.name.clone()))
                             .child(div().text_size(px(11.)).text_color(t.text2).truncate().child(match item.entry.mode {
-                                Mode::InPlace => "本物に付与",
-                                Mode::Clone => "クローン",
+                                Mode::InPlace => tr("本物に付与", "Applied to the real app"),
+                                Mode::Clone => tr("クローン", "Clone"),
                             })),
                     )
                     .when(needs_attention, |d| d.child(symbol("warning", 15., t.orange)))
@@ -416,13 +464,18 @@ impl MainView {
         let store = self.store.read(cx);
         let issues = store.issue_count();
         let (dot, summary) = if store.items.is_empty() {
-            (t.text3, "まだ登録がありません".to_string())
+            (t.text3, tr("まだ登録がありません", "No apps registered yet").to_string())
         } else if issues > 0 {
-            (t.orange, format!("要確認 {issues} 件"))
+            (t.orange, l!("要確認 {issues} 件", "Needs attention: {issues}"))
         } else {
-            (t.green, format!("{} 件に適用中", store.items.len()))
+            (t.green, l!("{} 件に適用中", "{} icon(s) applied", store.items.len()))
         };
-        let last = store.last_sync.map(|s| format!("自動同期: オン · {}", clock(s))).unwrap_or_else(|| "自動同期: オン".into());
+        let last = match (store.settings.auto_sync, store.last_sync) {
+            (true, Some(s)) => l!("自動同期: オン · {}", "Auto sync: on · {}", clock(s)),
+            (true, None) => tr("自動同期: オン", "Auto sync: on").to_string(),
+            (false, _) => tr("自動同期: オフ", "Auto sync: off").to_string(),
+        };
+        let settings_selected = self.pane == Pane::Settings;
         let add_selected = self.pane == Pane::Add;
         let (selected_bg, hover_bg) = (t.selected, t.hover);
 
@@ -452,7 +505,7 @@ impl MainView {
                     .text_size(px(11.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(t.text3)
-                    .child("アプリ"),
+                    .child(tr("アプリ", "Apps")),
             )
             .child(
                 div()
@@ -490,9 +543,27 @@ impl MainView {
                                     .justify_center()
                                     .child(symbol("add", 16., t.text2)),
                             )
-                            .child(div().text_size(px(13.)).child("アプリを追加"))
+                            .child(div().text_size(px(13.)).child(tr("アプリを追加", "Add App")))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.show_add(cx))),
                     ),
+            )
+            .child(
+                div().px(px(10.)).pb(px(6.)).child(
+                    div()
+                        .id("row-settings")
+                        .flex()
+                        .items_center()
+                        .gap(px(9.))
+                        .px(px(8.))
+                        .py(px(6.))
+                        .rounded(px(7.))
+                        .cursor_pointer()
+                        .when(settings_selected, |d| d.bg(selected_bg))
+                        .when(!settings_selected, |d| d.hover(move |s| s.bg(hover_bg)))
+                        .child(symbol("settings", 17., t.text2))
+                        .child(div().text_size(px(13.)).child(tr("設定", "Settings")))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.show_settings(cx))),
+                ),
             )
             .child(
                 div()
@@ -524,15 +595,15 @@ impl MainView {
         let id = item.entry.bundle_id.clone();
         let store = self.store.read(cx);
         let (mode_label, mode_color) = match item.entry.mode {
-            Mode::InPlace => ("本物に付与", t.green),
-            Mode::Clone => ("クローン", t.orange),
+            Mode::InPlace => (tr("本物に付与", "Applied to the real app"), t.green),
+            Mode::Clone => (tr("クローン", "Clone"), t.orange),
         };
         let (state_label, state_icon, state_color) = if item.applied && item.dock_stale {
-            ("Dock の更新が必要", "sync", t.orange)
+            (tr("Dock の更新が必要", "Dock refresh needed"), "sync", t.orange)
         } else if item.applied {
-            ("アイコン適用中", "check_circle", t.green)
+            (tr("アイコン適用中", "Icon applied"), "check_circle", t.green)
         } else {
-            ("アイコンが外れています", "warning", t.orange)
+            (tr("アイコンが外れています", "The icon was removed"), "warning", t.orange)
         };
         let target = store.target_path(&item.entry);
         // Dock の書き換え中は Dock の再起動を待っているので、ほかの操作で割り込ませない
@@ -569,7 +640,7 @@ impl MainView {
                                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.pick(PickFor::ChangeImage, cx)))
                             }),
                     )
-                    .child(div().text_size(px(10.)).text_color(t.text3).child("クリック・ドロップで変更")),
+                    .child(div().text_size(px(10.)).text_color(t.text3).child(tr("クリック・ドロップで変更", "Click or drop to change"))),
             )
             .child(
                 div()
@@ -584,8 +655,8 @@ impl MainView {
                             .gap(px(6.))
                             .child(pill(state_label, state_icon, state_color))
                             .child(pill(mode_label, if item.entry.mode == Mode::InPlace { "check_circle" } else { "info" }, mode_color))
-                            .when(split, |d| d.child(pill("タイルが分かれています", "warning", t.orange)))
-                            .when(item.tile == Some(TileState::Joined), |d| d.child(pill("Dock で動作中", "play_arrow", t.green))),
+                            .when(split, |d| d.child(pill(tr("タイルが分かれています", "Tiles are split"), "warning", t.orange)))
+                            .when(item.tile == Some(TileState::Joined), |d| d.child(pill(tr("Dock で動作中", "Animating in the Dock"), "play_arrow", t.green))),
                     )
                     .child(div().text_size(px(11.)).text_color(t.text2).truncate().child(item.entry.bundle_id.clone()))
                     .child(
@@ -593,18 +664,18 @@ impl MainView {
                             .flex()
                             .gap(px(8.))
                             .pt(px(4.))
-                            .child(button("launch", "起動", Some("play_arrow"), Kind::Primary, idle, t).when(idle, |d| {
+                            .child(button("launch", tr("起動", "Launch"), Some("play_arrow"), Kind::Primary, idle, t).when(idle, |d| {
                                 let id = id.clone();
                                 d.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.store.update(cx, |s, cx| s.launch(&id, cx))))
                             }))
-                            .child(button("change-image", "画像を変更", Some("image"), Kind::Normal, idle, t).when(idle, |d| {
+                            .child(button("change-image", tr("画像を変更", "Change Image"), Some("image"), Kind::Normal, idle, t).when(idle, |d| {
                                 d.on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.pick(PickFor::ChangeImage, cx)))
                             }))
-                            .child(button("reveal", "Finder で表示", Some("folder_open"), Kind::Normal, true, t).on_click({
+                            .child(button("reveal", tr("Finder で表示", "Reveal in Finder"), Some("folder_open"), Kind::Normal, true, t).on_click({
                                 let id = id.clone();
                                 cx.listener(move |this, _: &ClickEvent, _, cx| this.store.update(cx, |s, cx| s.reveal(&id, cx)))
                             }))
-                            .child(button("remove", "元に戻す", Some("undo"), Kind::Destructive, idle, t).when(idle, |d| {
+                            .child(button("remove", tr("元に戻す", "Restore"), Some("undo"), Kind::Destructive, idle, t).when(idle, |d| {
                                 let id = id.clone();
                                 d.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.store.update(cx, |s, cx| s.remove(&id, cx));
@@ -627,7 +698,7 @@ impl MainView {
         });
 
         let refresh_id = id.clone();
-        let refresh_button = button("refresh-dock", if refresh_busy.is_some() { "更新中…" } else { "Dock を更新" }, Some("sync"), Kind::Normal, idle, t)
+        let refresh_button = button("refresh-dock", if refresh_busy.is_some() { tr("更新中…", "Updating…") } else { tr("Dock を更新", "Refresh Dock") }, Some("sync"), Kind::Normal, idle, t)
             .when(idle, |d| {
                 d.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.store.update(cx, |s, cx| s.refresh_dock(&refresh_id, cx))
@@ -637,24 +708,24 @@ impl MainView {
         let (icon_row, refresh_row) = if item.applied && item.dock_stale {
             let row = setting_row(
                 tile("sync", t.orange, 28.),
-                "Dock がまだ前のアイコンです",
+                tr("Dock がまだ前のアイコンです", "The Dock still shows the old icon"),
                 refresh_busy.clone().unwrap_or_else(|| {
-                    "Dock は前のアイコンを覚えていて、アプリを再起動しても描き直しません。「Dock を更新」で反映されます(Dock が一瞬消えます。アプリは終了しません)".into()
+                    tr("Dock は前のアイコンを覚えていて、アプリを再起動しても描き直しません。「Dock を更新」で反映されます(Dock が一瞬消えます。アプリは終了しません)", "The Dock remembers the old icon and does not redraw it, even if you restart the app. \"Refresh Dock\" updates it (the Dock disappears briefly; the app does not quit)").into()
                 }),
                 t,
             );
             (with_button(row, refresh_button), None)
         } else {
             let icon_row = if item.applied {
-                setting_row(tile("check_circle", t.green, 28.), "アイコンが付いています", "Dock・Finder・アプリ切り替えに、選んだ画像が表示されます", t)
+                setting_row(tile("check_circle", t.green, 28.), tr("アイコンが付いています", "The icon is applied"), tr("Dock・Finder・アプリ切り替えに、選んだ画像が表示されます", "The chosen image is shown in the Dock, Finder, and app switcher"), t)
             } else {
-                setting_row(tile("warning", t.orange, 28.), "アイコンが外れています", "次の自動同期で付け直します。すぐに直すなら左下の同期ボタンを押してください", t)
+                setting_row(tile("warning", t.orange, 28.), tr("アイコンが外れています", "The icon was removed"), tr("次の自動同期で付け直します。すぐに直すなら左下の同期ボタンを押してください", "It will be reapplied at the next auto sync. To fix it now, press the sync button at the bottom left"), t)
             };
             let row = setting_row(
                 tile("settings_backup_restore", t.accent, 28.),
-                "Dock のアイコンが古いとき",
+                tr("Dock のアイコンが古いとき", "When the Dock icon is outdated"),
                 refresh_busy.clone().unwrap_or_else(|| {
-                    "Dock が覚えているアイコンを消して、Dock を再起動します。Dock が一瞬消えます。アプリは終了しませんが、起動中の動くタイルは分かれます".into()
+                    tr("Dock が覚えているアイコンを消して、Dock を再起動します。Dock が一瞬消えます。アプリは終了しませんが、起動中の動くタイルは分かれます", "Clears the icon the Dock remembers and restarts the Dock. The Dock disappears briefly. The app does not quit, but running animated tiles will split").into()
                 }),
                 t,
             );
@@ -669,20 +740,20 @@ impl MainView {
             .gap(px(12.))
             .child(div().flex_1().min_w_0().child(setting_row(
                 tile("play_arrow", if animated { t.green } else { t.accent }, 28.),
-                "Dock で動かす(実験的)",
+                tr("Dock で動かす(実験的)", "Animate in the Dock (experimental)"),
                 match (&dock_busy, animated, is_gif) {
                     (Some(step), _, _) => step.clone(),
                     (None, true, _) if item.entry.animation.as_ref().is_some_and(|a| a.direct) => {
-                        "起動用アプリ(Dock の動くタイル、Spotlight・Raycast に出る同名のアプリ、この画面の「起動」)から開けば、起動中もタイルは 1 つのまま動きます".into()
+                        tr("起動用アプリ(Dock の動くタイル、Spotlight・Raycast に出る同名のアプリ、この画面の「起動」)から開けば、起動中もタイルは 1 つのまま動きます", "Open the app from its launcher (the animated Dock tile, the same-named app in Spotlight or Raycast, or \"Launch\" here) and the tile stays single and animated while it runs").into()
                     }
-                    (None, true, _) => "このアプリはデータが保護されているため、本物を別に開いています。起動中は本物のタイル(静止画)も並びます".into(),
-                    (None, false, true) => "本物のタイルは Dock がアイコンを固定するので動かせません。代わりに、動くタイルを持つ起動用アプリを作ります".into(),
-                    (None, false, false) => SharedString::from("GIF を選ぶと動きます。今の画像ではそのまま表示されます"),
+                    (None, true, _) => tr("このアプリはデータが保護されているため、本物を別に開いています。起動中は本物のタイル(静止画)も並びます", "This app's data is protected, so the real app is opened separately. While it runs, the real tile (still image) appears too").into(),
+                    (None, false, true) => tr("本物のタイルは Dock がアイコンを固定するので動かせません。代わりに、動くタイルを持つ起動用アプリを作ります", "The Dock fixes the icon of a real tile, so it cannot be animated. Instead, DockMorph creates a launcher app that owns an animated tile").into(),
+                    (None, false, false) => SharedString::from(tr("GIF を選ぶと動きます。今の画像ではそのまま表示されます", "Choose a GIF to animate it. The current image is shown as is")),
                 },
                 t,
             )))
             .child(
-                button("animate", if dock_busy.is_some() { "設定中…" } else if animated { "オフにする" } else { "オンにする" }, None, Kind::Normal, idle, t).when(idle, |d| {
+                button("animate", if dock_busy.is_some() { tr("設定中…", "Setting up…") } else if animated { tr("オフにする", "Turn Off") } else { tr("オンにする", "Turn On") }, None, Kind::Normal, idle, t).when(idle, |d| {
                     d.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         if animated {
                             this.store.update(cx, |s, cx| s.set_animation(&anim_id, false, false, cx));
@@ -698,15 +769,15 @@ impl MainView {
             let on = a.auto_rejoin;
             let row = setting_row(
                 tile("sync", if on { t.green } else { t.accent }, 28.),
-                "直接開かれたら自動でまとめ直す",
+                tr("直接開かれたら自動でまとめ直す", "Rejoin automatically when opened directly"),
                 if on {
-                    "本物が直接開かれたら、起動した直後に自動で終了して、起動用アプリから開き直します。このアプリ用のリンク(会議リンクなど)は起動用アプリが受け取るので、そのまま 1 つのタイルで開きます。ファイルから開いた場合は、そのファイルは引き継がれません(DockMorph の常駐中だけ働きます)"
+                    tr("本物が直接開かれたら、起動した直後に自動で終了して、起動用アプリから開き直します。このアプリ用のリンク(会議リンクなど)は起動用アプリが受け取るので、そのまま 1 つのタイルで開きます。ファイルから開いた場合は、そのファイルは引き継がれません(DockMorph の常駐中だけ働きます)", "If the real app is opened directly, DockMorph quits it right after launch and reopens it from the launcher app. Links for this app (such as meeting links) are received by the launcher app, so they open in a single tile. If you open it from a file, that file is not carried over (works only while DockMorph is running)")
                 } else {
-                    "オフです。本物が直接開かれると、動かないタイルが出ます。「まとめ直す」で戻せます"
+                    tr("オフです。本物が直接開かれると、動かないタイルが出ます。「まとめ直す」で戻せます", "Off. If the real app is opened directly, a non-animated tile appears. \"Rejoin\" restores it")
                 },
                 t,
             );
-            let b = button("auto-rejoin", if on { "オフにする" } else { "オンにする" }, None, Kind::Normal, idle, t).when(idle, |d| {
+            let b = button("auto-rejoin", if on { tr("オフにする", "Turn Off") } else { tr("オンにする", "Turn On") }, None, Kind::Normal, idle, t).when(idle, |d| {
                 d.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.store.update(cx, |s, cx| s.set_auto_rejoin(&auto_id, !on, cx))))
             });
             with_button(row, b)
@@ -714,11 +785,11 @@ impl MainView {
         let ax_row = (animated && !self.store.read(cx).ax_trusted).then(|| {
             let row = setting_row(
                 tile("warning", t.orange, 28.),
-                "アクセシビリティの許可がありません",
-                "許可すると、Dock を再起動せずに動くタイルを置く・外すことができ、Dock の右側に残った本物のタイルも自動で消せます。許可がないと Dock を再起動するので起動中のほかの動くタイルが分かれ、残った本物のタイルも消えません",
+                tr("アクセシビリティの許可がありません", "Accessibility permission is not granted"),
+                tr("許可すると、Dock を再起動せずに動くタイルを置く・外すことができ、Dock の右側に残った本物のタイルも自動で消せます。許可がないと Dock を再起動するので起動中のほかの動くタイルが分かれ、残った本物のタイルも消えません", "With permission, DockMorph can place and remove animated tiles without restarting the Dock, and can remove leftover real-app tiles on the right side of the Dock automatically. Without it, the Dock restarts, so other running animated tiles split and leftover real-app tiles stay"),
                 t,
             );
-            let b = button("ax", "許可する", None, Kind::Normal, idle, t).when(idle, |d| {
+            let b = button("ax", tr("許可する", "Allow"), None, Kind::Normal, idle, t).when(idle, |d| {
                 d.on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.store.update(cx, |s, cx| s.request_accessibility(cx))))
             });
             with_button(row, b)
@@ -727,13 +798,13 @@ impl MainView {
         let split_row = split.then(|| {
             let row = setting_row(
                 tile("warning", t.orange, 28.),
-                "本物のタイルが別に出ています",
+                tr("本物のタイルが別に出ています", "The real app's tile appears separately"),
                 rejoin_busy.clone().unwrap_or_else(|| {
-                    "本物が起動用アプリを通さずに開かれたか、起動したあとに Dock が再起動したため、動かないタイルが Dock の右側に出ています。「まとめ直す」でこのアプリを再起動すると、動くタイル 1 つに戻ります".into()
+                    tr("本物が起動用アプリを通さずに開かれたか、起動したあとに Dock が再起動したため、動かないタイルが Dock の右側に出ています。「まとめ直す」でこのアプリを再起動すると、動くタイル 1 つに戻ります", "The real app was opened without the launcher app, or the Dock restarted after it launched, so a non-animated tile appears on the right side of the Dock. \"Rejoin\" restarts this app and returns to a single animated tile").into()
                 }),
                 t,
             );
-            let b = button("rejoin", if rejoin_busy.is_some() { "再起動中…" } else { "まとめ直す" }, Some("sync"), Kind::Normal, idle, t).when(idle, |d| {
+            let b = button("rejoin", if rejoin_busy.is_some() { tr("再起動中…", "Restarting…") } else { tr("まとめ直す", "Rejoin") }, Some("sync"), Kind::Normal, idle, t).when(idle, |d| {
                 d.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.store.update(cx, |s, cx| s.rejoin(&rejoin_id, cx))))
             });
             with_button(row, b)
@@ -748,8 +819,8 @@ impl MainView {
                 ax_row,
                 Some(setting_row(
                     tile("sync", t.accent, 28.),
-                    "アップデート後も自動で付け直す",
-                    "アプリの更新でアイコンが外れても、30 秒以内に付け直します。メニューバーに常駐している間も動きます",
+                    tr("アップデート後も自動で付け直す", "Reapply automatically after updates"),
+                    tr("アプリの更新でアイコンが外れても、30 秒以内に付け直します。メニューバーに常駐している間も動きます", "If an app update removes the icon, DockMorph reapplies it within 30 seconds. It works while DockMorph stays in the menu bar"),
                     t,
                 )),
             ]
@@ -761,21 +832,21 @@ impl MainView {
 
         let mut details = vec![
             kv_row(
-                "方式",
+                tr("方式", "Method"),
                 match item.entry.mode {
-                    Mode::InPlace => "本物のアプリに直接アイコンを付けています。署名はそのまま有効です",
-                    Mode::Clone => "本物に書き込めないため、複製(APFS クローン、追加容量なし)にアイコンを付けて、複製を起動します",
+                    Mode::InPlace => tr("本物のアプリに直接アイコンを付けています。署名はそのまま有効です", "The icon is attached directly to the real app. Its code signature stays valid"),
+                    Mode::Clone => tr("本物に書き込めないため、複製(APFS クローン、追加容量なし)にアイコンを付けて、複製を起動します", "The real app is not writable, so the icon is attached to a clone (APFS clone, no extra disk space) and the clone is launched"),
                 },
                 t,
             ),
-            kv_row("元のアプリ", item.entry.source_path.display().to_string(), t),
+            kv_row(tr("元のアプリ", "Original app"), item.entry.source_path.display().to_string(), t),
         ];
         if item.entry.mode == Mode::Clone {
             if let Some(p) = &target {
-                details.push(kv_row("起動するアプリ", p.display().to_string(), t));
+                details.push(kv_row(tr("起動するアプリ", "App that launches"), p.display().to_string(), t));
             }
         }
-        details.push(kv_row("画像", item.entry.icon_path.display().to_string(), t));
+        details.push(kv_row(tr("画像", "Image"), item.entry.icon_path.display().to_string(), t));
 
         div()
             .flex()
@@ -783,22 +854,218 @@ impl MainView {
             .gap(px(22.))
             .child(header)
             .children(issue)
-            .child(section("状態", status, t))
-            .child(section("詳細", rows(details, t), t))
+            .child(section(tr("状態", "Status"), status, t))
+            .child(section(tr("詳細", "Details"), rows(details, t), t))
+            .into_any_element()
+    }
+
+    fn settings_pane(&self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let (settings, ax_trusted, data_folder) = {
+            let store = self.store.read(cx);
+            (store.settings.clone(), store.ax_trusted, store.data_folder())
+        };
+        let login_on = login::is_enabled();
+        let auto_updates = cx.global::<crate::AppState>().updater.as_ref().map(|u| u.automatic_checks());
+        let version = updater::app_version().unwrap_or_else(|| tr("開発ビルド", "Development build").to_string());
+
+        let current = lang::resolve(settings.language);
+        let language_open = self.language_menu_open;
+        let choices = [(Language::English, "English"), (Language::Japanese, "日本語")];
+        let current_label = choices.iter().find(|(v, _)| *v == current).map_or("", |(_, name)| *name);
+        let (hover, selected_bg) = (t.hover, t.selected);
+        let trigger = div()
+            .id("lang-dropdown")
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(6.))
+            .w(px(130.))
+            .h(px(26.))
+            .pl(px(11.))
+            .pr(px(7.))
+            .rounded(px(6.))
+            .bg(t.button)
+            .text_size(px(13.))
+            .font_weight(FontWeight::MEDIUM)
+            .cursor_pointer()
+            .hover(|s| s.opacity(0.85))
+            .child(current_label)
+            .child(symbol("expand_more", 16., t.text2))
+            // 開いているときの外側クリックはポップアップ側が先に閉じるので、ここは描画時点の状態の反対にする
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.language_menu_open = !language_open;
+                cx.notify();
+            }));
+        let popup = language_open.then(|| {
+            deferred(
+                div()
+                    .absolute()
+                    .top(px(30.))
+                    .right_0()
+                    .w(px(130.))
+                    .p(px(4.))
+                    .rounded(px(8.))
+                    .bg(t.banner)
+                    .border_1()
+                    .border_color(t.card_border)
+                    .occlude()
+                    .shadow(vec![BoxShadow {
+                        color: Hsla { h: 0., s: 0., l: 0., a: 0.22 },
+                        offset: point(px(0.), px(4.)),
+                        blur_radius: px(14.),
+                        spread_radius: px(0.),
+                    }])
+                    .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.language_menu_open = false;
+                        cx.notify();
+                    }))
+                    .children(choices.iter().enumerate().map(|(i, (value, name))| {
+                        let value = *value;
+                        let selected = value == current;
+                        div()
+                            .id(("lang-option", i))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .px(px(8.))
+                            .py(px(5.))
+                            .rounded(px(5.))
+                            .text_size(px(13.))
+                            .cursor_pointer()
+                            .when(selected, |d| d.bg(selected_bg))
+                            .hover(move |s| s.bg(hover))
+                            .child(*name)
+                            .when(selected, |d| d.child(symbol("check_circle", 14., t.accent)))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.language_menu_open = false;
+                                this.store.update(cx, |s, cx| s.set_language(value, cx));
+                            }))
+                    })),
+            )
+            .with_priority(1)
+        });
+        let language = with_control(
+            plain_row(
+                tr("言語", "Language"),
+                tr("既定では、macOS の言語が日本語のときだけ日本語、それ以外は英語で表示します", "By default, DockMorph shows Japanese when your macOS language is Japanese, and English otherwise"),
+                t,
+            ),
+            div().relative().flex_none().child(trigger).children(popup),
+        );
+        let login_row = match login_on {
+            Some(on) => with_control(
+                plain_row(tr("ログイン時に起動", "Launch at login"), tr("Mac にログインしたとき、メニューバーに常駐します", "DockMorph stays in the menu bar after you log in"), t),
+                switch("sw-login", on, t).on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    if this.store.update(cx, |s, cx| s.toggle_login(cx)) {
+                        window.activate_window();
+                    }
+                    cx.notify();
+                })),
+            ),
+            None => plain_row(tr("ログイン時に起動", "Launch at login"), tr("DockMorph.app として起動したときだけ使えます", "Available only when launched as DockMorph.app"), t),
+        };
+        let sync_row = with_control(
+            plain_row(
+                tr("自動で同期する", "Sync automatically"),
+                tr(
+                    "30 秒ごとに、アップデートで外れたアイコンを付け直し、移動したアプリを探します",
+                    "Every 30 seconds, DockMorph reapplies icons removed by app updates and follows apps that moved",
+                ),
+                t,
+            ),
+            switch("sw-sync", settings.auto_sync, t).on_click({
+                let on = settings.auto_sync;
+                cx.listener(move |this, _: &ClickEvent, _, cx| this.store.update(cx, |s, cx| s.set_auto_sync(!on, cx)))
+            }),
+        );
+        let guard_row = with_control(
+            plain_row(
+                tr("起動中の Antigravity のアイコンを保持する", "Keep the icon of the running Antigravity"),
+                tr(
+                    "Antigravity が起動中に元のアイコンへ戻すのを抑止します。一時的にローカルのデバッグ接続を使います(Antigravity だけが対象です)",
+                    "Stops Antigravity from switching back to its original icon while it runs. Uses a temporary local debugging connection (Antigravity only)",
+                ),
+                t,
+            ),
+            switch("sw-guard", settings.keep_running_icon, t).on_click({
+                let on = settings.keep_running_icon;
+                cx.listener(move |this, _: &ClickEvent, _, cx| this.store.update(cx, |s, cx| s.set_keep_running_icon(!on, cx)))
+            }),
+        );
+        let ax_detail = if ax_trusted {
+            tr("許可されています。Dock を再起動せずに動くタイルを置く・外せます", "Allowed. DockMorph can place and remove animated tiles without restarting the Dock")
+        } else {
+            tr("許可がありません。許可すると、Dock を再起動せずに動くタイルを置く・外せます", "Not allowed. With permission, DockMorph can place and remove animated tiles without restarting the Dock")
+        };
+        let ax_row = if ax_trusted {
+            plain_row(tr("アクセシビリティ", "Accessibility"), ax_detail, t)
+        } else {
+            with_control(
+                plain_row(tr("アクセシビリティ", "Accessibility"), ax_detail, t),
+                button("ax-allow", tr("許可する", "Allow"), None, Kind::Normal, true, t)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.store.update(cx, |s, cx| s.request_accessibility(cx)))),
+            )
+        };
+        let updates_enabled = auto_updates.is_some();
+        let version_row = with_control(
+            plain_row(
+                tr("バージョン", "Version"),
+                if updates_enabled { version } else { l!("{version}(アップデートの確認は配布版でのみ使えます)", "{version} (update checking is available in release builds only)") },
+                t,
+            ),
+            button("check-updates", tr("今すぐ確認", "Check Now"), None, Kind::Normal, updates_enabled, t).when(updates_enabled, |d| {
+                d.on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                    if let Some(updater) = &cx.global::<crate::AppState>().updater {
+                        updater.check_for_updates();
+                    }
+                    cx.activate(true);
+                }))
+            }),
+        );
+        let update_rows = match auto_updates {
+            Some(on) => vec![
+                version_row,
+                with_control(
+                    plain_row(tr("自動でアップデートを確認する", "Check for updates automatically"), tr("起動中に定期的に確認します", "Checks periodically while DockMorph runs"), t),
+                    switch("sw-updates", on, t).on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                        if let Some(updater) = &cx.global::<crate::AppState>().updater {
+                            updater.set_automatic_checks(!on);
+                        }
+                        cx.notify();
+                    })),
+                ),
+            ],
+            None => vec![version_row],
+        };
+        let data_row = with_control(
+            plain_row(tr("データの場所", "Data folder"), data_folder, t),
+            button("reveal-data", tr("Finder で表示", "Reveal in Finder"), Some("folder_open"), Kind::Normal, true, t)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.store.update(cx, |s, cx| s.reveal_data_folder(cx)))),
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(22.))
+            .child(section(tr("一般", "General"), rows(vec![language, login_row], t), t))
+            .child(section(tr("同期", "Sync"), rows(vec![sync_row, guard_row], t), t))
+            .child(section(tr("許可", "Permissions"), rows(vec![ax_row], t), t))
+            .child(section(tr("アップデート", "Updates"), rows(update_rows, t), t))
+            .child(section(tr("データ", "Data"), rows(vec![data_row], t), t))
             .into_any_element()
     }
 
     fn slot(&self, for_app: bool, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let (path, label, empty_icon, tint) = if for_app {
-            (self.pending_app.clone(), "アプリ", "apps", t.accent)
+            (self.pending_app.clone(), tr("アプリ", "App"), "apps", t.accent)
         } else {
-            (self.pending_image.clone(), "新しいアイコン", "image", t.green)
+            (self.pending_image.clone(), tr("新しいアイコン", "New icon"), "image", t.green)
         };
         let filled = path.is_some();
         let preview: AnyElement = match (&path, for_app) {
             (Some(p), false) => self.picture(p, "pending-icon", 72., 16., cx),
             (Some(_), true) if self.pending_app_icon.is_some() => {
-                let icon = self.pending_app_icon.clone().expect("is_some で確認済み");
+                let icon = self.pending_app_icon.clone().expect("checked with is_some");
                 img(icon).id("pending-app-icon").size(px(72.)).flex_none().into_any_element()
             }
             _ => tile(empty_icon, tint, 56.).into_any_element(),
@@ -825,7 +1092,7 @@ impl MainView {
                     .max_w_full()
                     .truncate()
                     .text_color(if filled { t.text } else { t.text3 })
-                    .child(path.as_deref().map(file_name).unwrap_or_else(|| "クリックして選ぶ・ドロップ".into())),
+                    .child(path.as_deref().map(file_name).unwrap_or_else(|| tr("クリックして選ぶ・ドロップ", "Click to choose, or drop").into())),
             )
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.pick(if for_app { PickFor::App } else { PickFor::NewImage }, cx)
@@ -843,12 +1110,12 @@ impl MainView {
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).child("アプリのアイコンを変える"))
+                    .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).child(tr("アプリのアイコンを変える", "Change an app's icon")))
                     .child(
                         div()
                             .text_size(px(13.))
                             .text_color(t.text2)
-                            .child("アプリと画像を選ぶか、このウィンドウにドロップしてください。Dock は純正のまま、起動中もアイコンが変わります。"),
+                            .child(tr("アプリと画像を選ぶか、このウィンドウにドロップしてください。Dock は純正のまま、起動中もアイコンが変わります。", "Choose an app and an image, or drop them on this window. The Dock stays stock, and the icon changes while the app runs.")),
                     ),
             )
             .child(
@@ -879,11 +1146,11 @@ impl MainView {
                                     .min_w_0()
                                     .text_size(px(12.))
                                     .text_color(t.text2)
-                                    .child("本物のアプリに直接アイコンを付けます。書き込めないアプリだけ、複製を作る方式に切り替えてお知らせします。元に戻すといつでも元通りになります。"),
+                                    .child(tr("本物のアプリに直接アイコンを付けます。書き込めないアプリだけ、複製を作る方式に切り替えてお知らせします。元に戻すといつでも元通りになります。", "The icon is attached directly to the real app. Only if the app is not writable, DockMorph switches to a clone and tells you. You can always restore the original.")),
                             ),
                     )
                     .child(
-                        button("do-add", "アイコンを変える", Some("check_circle"), Kind::Primary, can_add, t)
+                        button("do-add", tr("アイコンを変える", "Change Icon"), Some("check_circle"), Kind::Primary, can_add, t)
                             .when(can_add, |d| d.on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.add(cx)))),
                     ),
             )
@@ -943,15 +1210,17 @@ impl Render for MainView {
         let t = Theme::for_appearance(window.appearance());
         let item = match &self.pane {
             Pane::Entry(id) => self.store.read(cx).item(id).cloned(),
-            Pane::Add => None,
+            Pane::Add | Pane::Settings => None,
         };
-        let title: SharedString = match &item {
-            Some(i) => i.name.clone(),
-            None => "アプリを追加".into(),
+        let title: SharedString = match (&item, &self.pane) {
+            (Some(i), _) => i.name.clone(),
+            (None, Pane::Settings) => tr("設定", "Settings").into(),
+            (None, _) => tr("アプリを追加", "Add App").into(),
         };
-        let body = match &item {
-            Some(i) => self.entry_pane(i, &t, cx),
-            None => self.add_pane(&t, cx),
+        let body = match (&item, &self.pane) {
+            (Some(i), _) => self.entry_pane(i, &t, cx),
+            (None, Pane::Settings) => self.settings_pane(&t, cx),
+            (None, _) => self.add_pane(&t, cx),
         };
         let accent = t.accent;
 

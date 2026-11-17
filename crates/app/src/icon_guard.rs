@@ -1,3 +1,4 @@
+use dockmorph_core::{l, tr};
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
@@ -16,7 +17,7 @@ pub struct Process {
 }
 
 pub fn update(process: &Process, restore: bool) -> Result<()> {
-    let helper = std::env::current_exe()?.parent().context("DockMorph の実行場所が分かりません")?.join("../Resources/DMIconGuard");
+    let helper = std::env::current_exe()?.parent().context(tr("DockMorph の実行場所が分かりません", "Cannot locate the DockMorph executable"))?.join("../Resources/DMIconGuard");
     let output = Command::new(&helper)
         .arg(if restore { "restore" } else { "apply" })
         .arg(process.pid.to_string())
@@ -26,7 +27,7 @@ pub fn update(process: &Process, restore: bool) -> Result<()> {
         .arg(&process.registry)
         .arg(process.port.to_string())
         .output()
-        .with_context(|| format!("起動中のアイコン制御を開始できません: {}", helper.display()))?;
+        .with_context(|| l!("起動中のアイコン制御を開始できません: {}", "Cannot start the running-icon control: {}", helper.display()))?;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }

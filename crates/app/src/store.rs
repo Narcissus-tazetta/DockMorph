@@ -1,5 +1,7 @@
+use dockmorph_core::{l, lang, tr, DockMorph, Entry, Language, Settings, SyncResult, TileState};
 use crate::icon_guard::{self, Process};
-use dockmorph_core::{DockMorph, Entry, SyncResult, TileState};
+use crate::login;
+
 use gpui::{AppContext, Context, SharedString};
 use std::collections::HashMap;
 use std::path::Path;
@@ -10,7 +12,9 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const BANNER_TIMEOUT: Duration = Duration::from_secs(4);
 // 本物が直接開かれたのを見つける間隔。起動中のアプリの一覧と、対象アプリのプロセス情報を読むだけ
 const AUTO_REJOIN_INTERVAL: Duration = Duration::from_secs(2);
-const ICON_GUARD_FAILURE: &str = "Antigravity の起動中のアイコンを保持できません";
+fn icon_guard_failure() -> &'static str {
+    tr("Antigravity の起動中のアイコンを保持できません", "Cannot keep the icon of the running Antigravity")
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Level {
@@ -61,6 +65,7 @@ pub struct Store {
     issues: HashMap<String, SharedString>,
     banner_seq: u64,
     pub ax_trusted: bool,
+    pub settings: Settings,
     /// Dock を書き換え中のアプリと、いまの手順。終わるまで他の操作を受け付けない
     pub busy: Option<(String, SharedString)>,
     /// busy の進み具合をどの行に出すか
@@ -86,10 +91,10 @@ pub enum DockJob {
 
 impl Store {
     /// 同期の定期実行はウィンドウではなくこのエンティティに持たせる。ウィンドウを閉じてメニューバーに常駐している間も止めないため
-    pub fn new(dm: DockMorph, cx: &mut Context<Self>) -> Self {
+    pub fn new(dm: DockMorph, settings: Settings, cx: &mut Context<Self>) -> Self {
         let mut store = Store {
             dm, items: vec![], banner: None, last_sync: None, issues: HashMap::new(), banner_seq: 0,
-            ax_trusted: DockMorph::accessibility_trusted(), busy: None, busy_job: DockJob::Animation,
+            ax_trusted: DockMorph::accessibility_trusted(), settings, busy: None, busy_job: DockJob::Animation,
             auto_rejoined: HashMap::new(), icon_guard_target: None, icon_guard_current: None,
             icon_guard_attempted: false, icon_guard_busy: false, icon_guard_issue: None,
             clearing_leftovers: false, leftover_error: None,
@@ -98,7 +103,7 @@ impl Store {
         store.sync(false, cx);
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(SYNC_INTERVAL).await;
-            if this.update(cx, |this, cx| this.sync(false, cx)).is_err() {
+            if this.update(cx, |this, cx| if this.settings.auto_sync { this.sync(false, cx) }).is_err() {
                 break;
             }
         })
@@ -149,8 +154,8 @@ impl Store {
                 let name = self.item(&id).map(|i| i.name.to_string()).unwrap_or_default();
                 return self.notify(
                     Level::Warn,
-                    format!("{name} を自動でまとめ直せません"),
-                    Some("開き直しても本物が直接開かれます。「Dock で動かす」をオフにしてからオンにし直してください".into()),
+                    l!("{name} を自動でまとめ直せません", "Cannot rejoin {name} automatically"),
+                    Some(tr("開き直しても本物が直接開かれます。「Dock で動かす」をオフにしてからオンにし直してください", "The real app still opens directly after reopening. Turn \"Animate in the Dock\" off and on again").into()),
                     cx,
                 );
             }
@@ -175,13 +180,13 @@ impl Store {
                     Ok(names) => {
                         this.leftover_error = None;
                         if !names.is_empty() {
-                            this.notify(Level::Info, "Dock に残っていた本物のタイルを消しました", Some(names.join("、")), cx);
+                            this.notify(Level::Info, tr("Dock に残っていた本物のタイルを消しました", "Removed the leftover tile of the real app from the Dock"), Some(names.join(tr("、", ", "))), cx);
                         }
                     }
                     Err(e) => {
                         let why = format!("{e:#}");
                         if this.leftover_error.as_ref() != Some(&why) {
-                            this.notify(Level::Warn, "Dock に残った本物のタイルを消せません", Some(why.clone()), cx);
+                            this.notify(Level::Warn, tr("Dock に残った本物のタイルを消せません", "Cannot remove the leftover tile of the real app from the Dock"), Some(why.clone()), cx);
                         }
                         this.leftover_error = Some(why);
                     }
@@ -196,7 +201,7 @@ impl Store {
         if self.icon_guard_busy {
             return;
         }
-        let desired = self.items.iter().find(|i| i.entry.bundle_id == icon_guard::BUNDLE_ID && i.tile == Some(TileState::Joined)).and_then(|i| {
+        let desired = self.items.iter().filter(|_| self.settings.keep_running_icon).find(|i| i.entry.bundle_id == icon_guard::BUNDLE_ID && i.tile == Some(TileState::Joined)).and_then(|i| {
             let (pid, started) = self.dm.running_process(&i.entry)?;
             // SIGUSR1 は起動時の inspector のポートを再利用する。
             let port = if DockMorph::startup_icon_guard(pid) { (20000 + pid % 40000) as u16 } else { 9229 };
@@ -227,11 +232,11 @@ impl Store {
                 if result.is_ok() {
                     this.icon_guard_current = completed_target;
                 }
-                this.icon_guard_issue = result.as_ref().err().map(|e| format!("起動中のアイコン上書きを抑止できません: {e:#}。「今すぐ同期」で再試行できます").into());
+                this.icon_guard_issue = result.as_ref().err().map(|e| l!("起動中のアイコン上書きを抑止できません: {e:#}。「今すぐ同期」で再試行できます", "Cannot suppress icon overwrites in the running app: {e:#}. Retry with \"Sync Now\"").into());
                 if let Err(e) = result {
-                    this.notify(Level::Warn, ICON_GUARD_FAILURE, Some(format!("{e:#}")), cx);
-                } else if had_issue && this.banner.as_ref().is_some_and(|b| b.title.as_ref() == ICON_GUARD_FAILURE) {
-                    this.notify(Level::Success, "Antigravity の起動中のアイコンを保持しています", None, cx);
+                    this.notify(Level::Warn, icon_guard_failure(), Some(format!("{e:#}")), cx);
+                } else if had_issue && this.banner.as_ref().is_some_and(|b| b.title.as_ref() == icon_guard_failure()) {
+                    this.notify(Level::Success, tr("Antigravity の起動中のアイコンを保持しています", "Keeping the icon of the running Antigravity"), None, cx);
                 }
                 this.reload(cx);
             }).ok();
@@ -245,14 +250,76 @@ impl Store {
 
     pub fn set_auto_rejoin(&mut self, bundle_id: &str, on: bool, cx: &mut Context<Self>) {
         if self.busy.is_some() {
-            self.notify(Level::Info, "Dock の更新中です", Some("完了してから操作してください".into()), cx);
+            self.notify(Level::Info, tr("Dock の更新中です", "The Dock is being updated"), Some(tr("完了してから操作してください", "Wait until it finishes").into()), cx);
             return ;
         }
         let result = self.dm.set_auto_rejoin(bundle_id, on);
         self.reload(cx);
         if let Err(e) = result {
-            self.notify(Level::Error, "設定を変えられません", Some(format!("{e:#}")), cx);
+            self.notify(Level::Error, tr("設定を変えられません", "Cannot change the setting"), Some(format!("{e:#}")), cx);
         }
+    }
+
+    /// 保存できたときだけ反映する。保存に失敗したのに画面だけ変わると、次の起動で元に戻って食い違う
+    fn save_settings(&mut self, settings: Settings, cx: &mut Context<Self>) -> bool {
+        if let Err(e) = self.dm.save_settings(&settings) {
+            self.notify(Level::Error, tr("設定を保存できません", "Cannot save the settings"), Some(format!("{e:#}")), cx);
+            return false;
+        }
+        self.settings = settings;
+        cx.notify();
+        true
+    }
+
+    pub fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
+        if self.save_settings(Settings { language: Some(language), ..self.settings.clone() }, cx) {
+            lang::set(Some(language));
+        }
+    }
+
+    pub fn set_auto_sync(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.save_settings(Settings { auto_sync: on, ..self.settings.clone() }, cx);
+    }
+
+    /// オフにすると、適用済みの抑止は次の更新で元の動作に戻る
+    pub fn set_keep_running_icon(&mut self, on: bool, cx: &mut Context<Self>) {
+        if !self.save_settings(Settings { keep_running_icon: on, ..self.settings.clone() }, cx) {
+            return;
+        }
+        // オフにしたあとも、前の失敗の表示が対象アプリの行に残らないようにする
+        if !on {
+            self.icon_guard_issue = None;
+        }
+        self.icon_guard_attempted = false;
+        self.update_icon_guard(cx);
+        self.reload(cx);
+    }
+
+    pub fn reveal_data_folder(&mut self, cx: &mut Context<Self>) {
+        let dir = self.dm.home_dir().to_path_buf();
+        if let Err(e) = std::process::Command::new("/usr/bin/open").arg(&dir).status().map_err(anyhow::Error::from) {
+            self.notify(Level::Error, tr("Finder で表示できません", "Cannot reveal in Finder"), Some(format!("{}: {e:#}", dir.display())), cx);
+        }
+    }
+
+    /// 結果はバナーで伝える。警告と失敗は画面を見ていないと気づけないので true を返し、呼び出し側がウィンドウを開く
+    pub fn toggle_login(&mut self, cx: &mut Context<Self>) -> bool {
+        let (level, title, detail) = match login::toggle() {
+            Ok(login::Outcome::Enabled) => (Level::Success, tr("ログイン時に起動します", "DockMorph will launch at login"), None),
+            Ok(login::Outcome::Disabled) => (Level::Info, tr("ログイン時に起動しません", "DockMorph will not launch at login"), None),
+            Ok(login::Outcome::NeedsApproval) => (
+                Level::Warn,
+                tr("ログイン項目の許可が必要です", "Login Items approval is required"),
+                Some(tr("開いたシステム設定の「ログイン項目」で DockMorph をオンにしてください", "Turn on DockMorph in Login Items in the System Settings that just opened").to_string()),
+            ),
+            Err(e) => (Level::Error, tr("ログイン項目を変更できません", "Cannot change Login Items"), Some(format!("{e:#}"))),
+        };
+        self.notify(level, title, detail, cx);
+        !matches!(level, Level::Success | Level::Info)
+    }
+
+    pub fn data_folder(&self) -> String {
+        self.dm.home_dir().display().to_string()
     }
 
     pub fn issue_count(&self) -> usize {
@@ -307,7 +374,7 @@ impl Store {
                     })
                     .collect();
             }
-            Err(e) => self.notify(Level::Error, "登録を読み込めません", Some(format!("{e:#}")), cx),
+            Err(e) => self.notify(Level::Error, tr("登録を読み込めません", "Cannot load registrations"), Some(format!("{e:#}")), cx),
         }
         cx.notify();
     }
@@ -316,7 +383,7 @@ impl Store {
     pub fn sync(&mut self, manual: bool, cx: &mut Context<Self>) {
         if self.busy.is_some() {
             if manual {
-                self.notify(Level::Info, "Dock の更新中です", Some("完了してから同期してください".into()), cx);
+                self.notify(Level::Info, tr("Dock の更新中です", "The Dock is being updated"), Some(tr("完了してから同期してください", "Wait until it finishes before syncing").into()), cx);
             }
             return;
         }
@@ -326,7 +393,7 @@ impl Store {
         let results = match self.dm.sync() {
             Ok(r) => r,
             Err(e) => {
-                self.notify(Level::Error, "同期できません", Some(format!("{e:#}")), cx);
+                self.notify(Level::Error, tr("同期できません", "Cannot sync"), Some(format!("{e:#}")), cx);
                 return;
             }
         };
@@ -341,7 +408,7 @@ impl Store {
                 SyncResult::Recloned(id) | SyncResult::Reapplied(id) => changed.push(id),
                 SyncResult::Relocated(id, path) => moved.push(format!("{id} → {}", path.display())),
                 SyncResult::SkippedRunning(id) => {
-                    self.issues.insert(id, "複製が起動中のため、元アプリの更新を反映できていません。終了すると反映されます".into());
+                    self.issues.insert(id, tr("複製が起動中のため、元アプリの更新を反映できていません。終了すると反映されます", "A clone is running, so the source app's update is not applied yet. It is applied once the clone quits").into());
                 }
                 SyncResult::Failed(id, why) => {
                     self.issues.insert(id, why.into());
@@ -354,29 +421,29 @@ impl Store {
         if !new_issues.is_empty() || (manual && !self.issues.is_empty()) {
             let mut lines: Vec<_> = self.issues.iter().map(|(id, why)| format!("{}: {why}", name(id))).collect();
             if !changed.is_empty() {
-                lines.push(format!("付け直したアプリ: {}", changed.iter().map(|id| name(id)).collect::<Vec<_>>().join("、")));
+                lines.push(l!("付け直したアプリ: {}", "Reapplied to: {}", changed.iter().map(|id| name(id)).collect::<Vec<_>>().join(tr("、", ", "))));
             }
             let detail = lines.join("\n");
-            self.notify(Level::Warn, format!("{} 件のアプリで問題があります", self.issues.len()), Some(detail), cx);
+            self.notify(Level::Warn, l!("{} 件のアプリで問題があります", "{} app(s) have problems", self.issues.len()), Some(detail), cx);
         } else if !previous.is_empty() && self.issues.is_empty() {
             // 残したままの警告バナーが、解消後も出続けないようにする
-            self.notify(Level::Success, "問題は解消しました", None, cx);
+            self.notify(Level::Success, tr("問題は解消しました", "The problem is resolved"), None, cx);
         } else if !changed.is_empty() {
-            let names = changed.iter().map(|id| name(id)).collect::<Vec<_>>().join("、");
-            self.notify(Level::Success, "アイコンを付け直しました", Some(format!("{names}(アップデートなどで外れていました)")), cx);
+            let names = changed.iter().map(|id| name(id)).collect::<Vec<_>>().join(tr("、", ", "));
+            self.notify(Level::Success, tr("アイコンを付け直しました", "Reapplied icons"), Some(l!("{names}(アップデートなどで外れていました)", "{names} (the icon had been removed, for example by an update)")), cx);
         } else if !moved.is_empty() {
-            self.notify(Level::Info, "移動されたアプリに追従しました", Some(moved.join("\n")), cx);
+            self.notify(Level::Info, tr("移動されたアプリに追従しました", "Followed an app that was moved"), Some(moved.join("\n")), cx);
         } else if manual && self.icon_guard_issue.is_some() {
-            self.notify(Level::Info, "起動中のアイコン制御を再試行します", None, cx);
+            self.notify(Level::Info, tr("起動中のアイコン制御を再試行します", "Retrying the running-icon control"), None, cx);
         } else if manual {
-            self.notify(Level::Success, "すべて最新です", None, cx);
+            self.notify(Level::Success, tr("すべて最新です", "Everything is up to date"), None, cx);
         }
     }
 
     /// 成功したら追加した bundle ID を返す
     pub fn add(&mut self, app: &Path, image: &Path, cx: &mut Context<Self>) -> Option<String> {
         if self.busy.is_some() {
-            self.notify(Level::Info, "Dock の更新中です", Some("完了してから操作してください".into()), cx);
+            self.notify(Level::Info, tr("Dock の更新中です", "The Dock is being updated"), Some(tr("完了してから操作してください", "Wait until it finishes").into()), cx);
             return None;
         }
         let result = self.dm.add(app, image, false);
@@ -387,22 +454,22 @@ impl Store {
                 match r.fallback_reason {
                     Some(why) => self.notify(
                         Level::Warn,
-                        format!("{name} はクローン方式で追加しました"),
-                        Some(format!("本物のアプリに書き込めなかったため、複製にアイコンを付けています。起動は DockMorph か複製から行ってください。\n理由: {why}")),
+                        l!("{name} はクローン方式で追加しました", "Added {name} using the clone method"),
+                        Some(l!("本物のアプリに書き込めなかったため、複製にアイコンを付けています。起動は DockMorph か複製から行ってください。\n理由: {why}", "Could not write to the real app, so the icon is applied to a clone. Launch it from DockMorph or the clone.\nReason: {why}")),
                         cx,
                     ),
                     None if self.item(&r.entry.bundle_id).is_some_and(|i| i.dock_stale) => self.notify(
                         Level::Warn,
-                        format!("{name} のアイコンを変えました。Dock には「Dock を更新」で反映されます"),
-                        Some(DOCK_STALE_DETAIL.into()),
+                        l!("{name} のアイコンを変えました。Dock には「Dock を更新」で反映されます", "Changed the icon of {name}. Use \"Refresh Dock\" to update it in the Dock"),
+                        Some(dock_stale_detail().into()),
                         cx,
                     ),
-                    None => self.notify(Level::Success, format!("{name} のアイコンを変えました"), None, cx),
+                    None => self.notify(Level::Success, l!("{name} のアイコンを変えました", "Changed the icon of {name}"), None, cx),
                 }
                 Some(r.entry.bundle_id)
             }
             Err(e) => {
-                self.notify(Level::Error, "追加できません", Some(format!("{e:#}")), cx);
+                self.notify(Level::Error, tr("追加できません", "Cannot add"), Some(format!("{e:#}")), cx);
                 None
             }
         }
@@ -410,7 +477,7 @@ impl Store {
 
     pub fn change_image(&mut self, bundle_id: &str, image: &Path, cx: &mut Context<Self>) {
         if self.busy.is_some() {
-            self.notify(Level::Info, "Dock の更新中です", Some("完了してから操作してください".into()), cx);
+            self.notify(Level::Info, tr("Dock の更新中です", "The Dock is being updated"), Some(tr("完了してから操作してください", "Wait until it finishes").into()), cx);
             return ;
         }
         let name = self.item(bundle_id).map(|i| i.name.to_string()).unwrap_or_else(|| bundle_id.to_string());
@@ -419,12 +486,12 @@ impl Store {
         match result {
             Ok(_) if self.item(bundle_id).is_some_and(|i| i.dock_stale) => self.notify(
                 Level::Warn,
-                format!("{name} の画像を変えました。Dock には「Dock を更新」で反映されます"),
-                Some(DOCK_STALE_DETAIL.into()),
+                l!("{name} の画像を変えました。Dock には「Dock を更新」で反映されます", "Changed the image of {name}. Use \"Refresh Dock\" to update it in the Dock"),
+                Some(dock_stale_detail().into()),
                 cx,
             ),
-            Ok(_) => self.notify(Level::Success, format!("{name} の画像を変えました"), None, cx),
-            Err(e) => self.notify(Level::Error, format!("{name} の画像を変えられません"), Some(format!("{e:#}")), cx),
+            Ok(_) => self.notify(Level::Success, l!("{name} の画像を変えました", "Changed the image of {name}"), None, cx),
+            Err(e) => self.notify(Level::Error, l!("{name} の画像を変えられません", "Cannot change the image of {name}"), Some(format!("{e:#}")), cx),
         }
     }
 
@@ -441,11 +508,11 @@ impl Store {
             Ok(names) if names.is_empty() => {}
             Ok(names) => self.notify(
                 Level::Info,
-                "起動用アプリを更新しました",
-                Some(format!("{}(起動中のアプリには、次に開き直したときから効きます)", names.join("、"))),
+                tr("起動用アプリを更新しました", "Updated the launcher app"),
+                Some(l!("{}(起動中のアプリには、次に開き直したときから効きます)", "{} (applies to running apps the next time they are reopened)", names.join(tr("、", ", ")))),
                 cx,
             ),
-            Err(e) => self.notify(Level::Error, "起動用アプリを更新できません", Some(format!("{e:#}")), cx),
+            Err(e) => self.notify(Level::Error, tr("起動用アプリを更新できません", "Cannot update the launcher app"), Some(format!("{e:#}")), cx),
         }
     }
 
@@ -488,13 +555,13 @@ impl Store {
             bundle_id,
             DockJob::Animation,
             match (on, pin) {
-                (true, true) => "Dock に動くタイルを置いています…",
-                (true, false) => "起動用アプリを作っています…",
-                (false, _) => "動くタイルを外しています…",
+                (true, true) => tr("Dock に動くタイルを置いています…", "Placing the animated tile in the Dock…"),
+                (true, false) => tr("起動用アプリを作っています…", "Creating the launcher app…"),
+                (false, _) => tr("動くタイルを外しています…", "Removing the animated tile…"),
             },
             move |dm| {
                 if on {
-                    let t = template.ok_or_else(|| anyhow::anyhow!("DockMorph の場所が分かりません"))?;
+                    let t = template.ok_or_else(|| anyhow::anyhow!("{}", l!("DockMorph の場所が分かりません", "Cannot locate DockMorph")))?;
                     dm.enable_animation(&id, &t, pin).map(|r| (r.fallback_reason, r.pin_note))
                 } else {
                     dm.disable_animation(&id).map(|warning| (warning, None))
@@ -505,24 +572,24 @@ impl Store {
                 let text = [why, note].into_iter().flatten().collect::<Vec<_>>().join("\n");
                 (!text.is_empty()).then_some((text, only_note))
             }), on) {
-                (Ok(Some((note, true))), true) => this.notify(Level::Warn, format!("{name} を Dock で動かしています"), Some(note), cx),
+                (Ok(Some((note, true))), true) => this.notify(Level::Warn, l!("{name} を Dock で動かしています", "{name} is animated in the Dock"), Some(note), cx),
                 (Ok(None), true) if pin => this.notify(
                     Level::Success,
-                    format!("{name} を Dock で動かしています"),
-                    Some("Dock に動くタイルを置きました。ここから開けば、起動中もタイルは 1 つのまま動きます".into()),
+                    l!("{name} を Dock で動かしています", "{name} is animated in the Dock"),
+                    Some(tr("Dock に動くタイルを置きました。ここから開けば、起動中もタイルは 1 つのまま動きます", "Placed the animated tile in the Dock. Open the app from there and the tile stays single and animated while it runs").into()),
                     cx,
                 ),
                 (Ok(None), true) => this.notify(
                     Level::Success,
-                    format!("{name} の起動用アプリを作りました"),
-                    Some(format!("Dock には置いていません。Spotlight や Raycast で「{name}」の起動用アプリを開くか、この画面の「起動」から開くと、起動中は Dock の右側で動きます")),
+                    l!("{name} の起動用アプリを作りました", "Created the launcher app for {name}"),
+                    Some(l!("Dock には置いていません。Spotlight や Raycast で「{name}」の起動用アプリを開くか、この画面の「起動」から開くと、起動中は Dock の右側で動きます", "Not placed in the Dock. Open the launcher app for \"{name}\" from Spotlight or Raycast, or use \"Launch\" here, and it animates on the right side of the Dock while running")),
                     cx,
                 ),
-                (Ok(Some((why, _))), true) => this.notify(Level::Warn, format!("{name} を Dock で動かしています(タイルが 2 つ並ぶ方式)"), Some(why), cx),
-                (Ok(None), false) => this.notify(Level::Success, format!("{name} の動くタイルを外しました"), None, cx),
-                (Ok(Some((why, _))), false) => this.notify(Level::Warn, format!("{name} の動くタイルを外しました"), Some(why), cx),
-                (Err(e), true) => this.notify(Level::Error, format!("{name} を Dock で動かせません"), Some(format!("{e:#}")), cx),
-                (Err(e), false) => this.notify(Level::Error, format!("{name} の動くタイルを外せません"), Some(format!("{e:#}")), cx),
+                (Ok(Some((why, _))), true) => this.notify(Level::Warn, l!("{name} を Dock で動かしています(タイルが 2 つ並ぶ方式)", "{name} is animated in the Dock (two tiles appear side by side)"), Some(why), cx),
+                (Ok(None), false) => this.notify(Level::Success, l!("{name} の動くタイルを外しました", "Removed the animated tile of {name}"), None, cx),
+                (Ok(Some((why, _))), false) => this.notify(Level::Warn, l!("{name} の動くタイルを外しました", "Removed the animated tile of {name}"), Some(why), cx),
+                (Err(e), true) => this.notify(Level::Error, l!("{name} を Dock で動かせません", "Cannot animate {name} in the Dock"), Some(format!("{e:#}")), cx),
+                (Err(e), false) => this.notify(Level::Error, l!("{name} の動くタイルを外せません", "Cannot remove the animated tile of {name}"), Some(format!("{e:#}")), cx),
             },
             cx,
         );
@@ -535,7 +602,7 @@ impl Store {
         self.run_dock_job(
             bundle_id,
             DockJob::Rejoin,
-            "アプリを終了して、起動用アプリから開き直しています…",
+            tr("アプリを終了して、起動用アプリから開き直しています…", "Quitting the app and reopening it from the launcher app…"),
             move |dm| {
                 dm.rejoin(&id)?;
                 // 起動したアプリが一覧に載るのを待ってから状態を読み直させる
@@ -544,10 +611,10 @@ impl Store {
             },
             move |this, result, cx| match result {
                 Ok(()) => {
-                    this.notify(Level::Success, format!("{name} のタイルを 1 つにまとめました"), None, cx);
+                    this.notify(Level::Success, l!("{name} のタイルを 1 つにまとめました", "Merged the tiles of {name} into one"), None, cx);
                     this.clear_leftovers(cx);
                 }
-                Err(e) => this.notify(Level::Error, format!("{name} のタイルをまとめられません"), Some(format!("{e:#}")), cx),
+                Err(e) => this.notify(Level::Error, l!("{name} のタイルをまとめられません", "Cannot merge the tiles of {name}"), Some(format!("{e:#}")), cx),
             },
             cx,
         );
@@ -555,18 +622,18 @@ impl Store {
 
     pub fn remove(&mut self, bundle_id: &str, cx: &mut Context<Self>) {
         if self.busy.is_some() {
-            self.notify(Level::Info, "Dock の更新中です", Some("完了してから操作してください".into()), cx);
+            self.notify(Level::Info, tr("Dock の更新中です", "The Dock is being updated"), Some(tr("完了してから操作してください", "Wait until it finishes").into()), cx);
             return ;
         }
         let name = self.item(bundle_id).map(|i| i.name.to_string()).unwrap_or_else(|| bundle_id.to_string());
         let id = bundle_id.to_string();
         let done = move |this: &mut Self, result: anyhow::Result<Option<String>>, cx: &mut Context<Self>| match result {
-            Ok(None) => this.notify(Level::Success, format!("{name} を元のアイコンに戻しました"), None, cx),
-            Ok(Some(why)) => this.notify(Level::Warn, format!("{name} を元のアイコンに戻しました"), Some(why), cx),
-            Err(e) => this.notify(Level::Error, format!("{name} を元に戻せません"), Some(format!("{e:#}")), cx),
+            Ok(None) => this.notify(Level::Success, l!("{name} を元のアイコンに戻しました", "Restored the original icon of {name}"), None, cx),
+            Ok(Some(why)) => this.notify(Level::Warn, l!("{name} を元のアイコンに戻しました", "Restored the original icon of {name}"), Some(why), cx),
+            Err(e) => this.notify(Level::Error, l!("{name} を元に戻せません", "Cannot restore {name}"), Some(format!("{e:#}")), cx),
         };
         if self.item(bundle_id).is_some_and(|i| i.entry.animation.is_some()) {
-            self.run_dock_job(bundle_id, DockJob::Animation, "動くタイルを外しています…", move |dm| dm.remove(&id), done, cx);
+            self.run_dock_job(bundle_id, DockJob::Animation, tr("動くタイルを外しています…", "Removing the animated tile…"), move |dm| dm.remove(&id), done, cx);
         } else {
             let result = self.dm.remove(bundle_id);
             self.reload(cx);
@@ -576,11 +643,11 @@ impl Store {
 
     pub fn launch(&mut self, bundle_id: &str, cx: &mut Context<Self>) {
         if self.busy.is_some() {
-            self.notify(Level::Info, "Dock の更新中です", Some("完了してから操作してください".into()), cx);
+            self.notify(Level::Info, tr("Dock の更新中です", "The Dock is being updated"), Some(tr("完了してから操作してください", "Wait until it finishes").into()), cx);
             return ;
         }
         if let Err(e) = self.dm.launch(bundle_id) {
-            return self.notify(Level::Error, "起動できません", Some(format!("{e:#}")), cx);
+            return self.notify(Level::Error, tr("起動できません", "Cannot launch"), Some(format!("{e:#}")), cx);
         }
         // タイルの状態(起動中か、1 つにまとまっているか)を、次の自動同期を待たずに出す
         cx.spawn(async move |this, cx| {
@@ -594,11 +661,11 @@ impl Store {
         self.run_dock_job(
             bundle_id,
             DockJob::Refresh,
-            "Dock を再起動しています…",
+            tr("Dock を再起動しています…", "Restarting the Dock…"),
             |dm| dm.refresh_dock(),
             |this, result, cx| match result {
-                Ok(()) => this.notify(Level::Success, "Dock を更新しました", None, cx),
-                Err(e) => this.notify(Level::Error, "Dock を更新できません", Some(format!("{e:#}")), cx),
+                Ok(()) => this.notify(Level::Success, tr("Dock を更新しました", "Refreshed the Dock"), None, cx),
+                Err(e) => this.notify(Level::Error, tr("Dock を更新できません", "Cannot refresh the Dock"), Some(format!("{e:#}")), cx),
             },
             cx,
         );
@@ -606,7 +673,7 @@ impl Store {
 
     pub fn reveal(&mut self, bundle_id: &str, cx: &mut Context<Self>) {
         if let Err(e) = self.dm.reveal(bundle_id) {
-            self.notify(Level::Error, "Finder で表示できません", Some(format!("{e:#}")), cx);
+            self.notify(Level::Error, tr("Finder で表示できません", "Cannot reveal in Finder"), Some(format!("{e:#}")), cx);
         }
     }
 
@@ -615,7 +682,9 @@ impl Store {
     }
 }
 
-const DOCK_STALE_DETAIL: &str = "Finder ではすでに変わっています。Dock は前のアイコンを覚えていて、アプリや Dock を再起動しても描き直しません";
+fn dock_stale_detail() -> &'static str {
+    tr("Finder ではすでに変わっています。Dock は前のアイコンを覚えていて、アプリや Dock を再起動しても描き直しません", "Finder already shows the new icon. The Dock remembers the old icon and does not redraw it, even if you restart the app or the Dock")
+}
 
 /// 時刻だけを表示する。日付をまたぐほど同期が止まっていれば、それ自体が異常なので気付ける
 pub fn clock(t: SystemTime) -> String {

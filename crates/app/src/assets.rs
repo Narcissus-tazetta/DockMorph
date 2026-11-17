@@ -14,7 +14,7 @@ macro_rules! icons {
 
 icons!(
     "add", "sync", "play_arrow", "folder_open", "undo", "check_circle", "warning", "info", "close", "apps", "image",
-    "download", "settings_backup_restore",
+    "download", "settings_backup_restore", "settings", "expand_more",
 );
 
 pub const MENUBAR_ICON: &[u8] = include_bytes!("../assets/menubar.svg");

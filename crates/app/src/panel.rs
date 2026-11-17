@@ -1,6 +1,7 @@
 //! gpui の prompt_for_paths は開く場所を指定できず、macOS が覚えている前回の場所で開く。
 //! アプリは /Applications にあることが大半なので、アプリ選択だけ自前の NSOpenPanel で開く場所を決める。
 
+use dockmorph_core::{l};
 use block2::RcBlock;
 use futures::channel::oneshot;
 use objc2::MainThreadMarker;
@@ -13,7 +14,7 @@ use std::path::{Path, PathBuf};
 pub fn pick_file(prompt: &str, directory: &Path) -> oneshot::Receiver<anyhow::Result<Option<Vec<PathBuf>>>> {
     let (tx, rx) = oneshot::channel();
     let Some(mtm) = MainThreadMarker::new() else {
-        let _ = tx.send(Err(anyhow::anyhow!("ファイル選択パネルはメインスレッドでしか開けません")));
+        let _ = tx.send(Err(anyhow::anyhow!("{}", l!("ファイル選択パネルはメインスレッドでしか開けません", "The file picker can only be opened on the main thread"))));
         return rx;
     };
     let panel = NSOpenPanel::openPanel(mtm);

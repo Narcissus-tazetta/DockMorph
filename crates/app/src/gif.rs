@@ -2,6 +2,7 @@
 //! 背面にあったウィンドウを前に出すと、溜まった分を画面の更新ごとに送るので長いあいだ早送りになる。
 //! そこで GIF は自前でコマに分け、経過時刻から今のコマを決めて 1 枚の画像として渡す。
 
+use dockmorph_core::{tr};
 use gpui::{Context, ImageSource, RenderImage, Task, Window};
 use image::{codecs::gif::GifDecoder, imageops, AnimationDecoder, Frame, RgbaImage};
 use std::cell::RefCell;
@@ -23,12 +24,12 @@ struct Anim {
 impl Anim {
     /// 今のコマと、次のコマに変わるまでの時間
     fn at(&self, elapsed: Duration) -> (Arc<RenderImage>, Option<Duration>) {
-        let total = *self.ends_ms.last().expect("コマは 1 つ以上ある");
+        let total = *self.ends_ms.last().expect("a GIF has at least one frame");
         if self.frames.len() == 1 {
             return (self.frames[0].clone(), None);
         }
         let t = elapsed.as_millis() as u64 % total;
-        let i = self.ends_ms.iter().position(|&end| t < end).expect("t は total 未満");
+        let i = self.ends_ms.iter().position(|&end| t < end).expect("t is below total");
         (self.frames[i].clone(), Some(Duration::from_millis(self.ends_ms[i] - t)))
     }
 }
@@ -89,7 +90,7 @@ impl Gifs {
                     let slot = match decoded.await {
                         Ok(anim) => Slot::Ready(Arc::new(anim)),
                         Err(e) => {
-                            eprintln!("GIF をコマに分けられません: {}: {e:#}", p.display());
+                            eprintln!("Cannot split the GIF into frames: {}: {e:#}", p.display());
                             Slot::Failed
                         }
                     };
@@ -140,7 +141,7 @@ fn decode(path: &Path) -> anyhow::Result<Anim> {
         ends_ms.push(total);
         frames.push(Arc::new(RenderImage::new(vec![Frame::new(to_bgra(shrink(frame.into_buffer())))])));
     }
-    anyhow::ensure!(!frames.is_empty(), "コマがありません");
+    anyhow::ensure!(!frames.is_empty(), tr("コマがありません", "The GIF has no frames"));
     Ok(Anim { frames, ends_ms })
 }
 

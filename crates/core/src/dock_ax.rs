@@ -68,11 +68,11 @@ pub fn keep(dock_pid: u32, app: &Path) -> Result<bool> {
 /// app を指すタイル。running を指定したら、起動中かどうかが合うものだけ
 fn find_tile(dock_pid: u32, app: &Path, running: Option<bool>) -> Result<Option<CFRetained<AXUIElement>>> {
     if !trusted() {
-        bail!("アクセシビリティの許可がありません");
+        bail!("{}", l!("アクセシビリティの許可がありません", "Accessibility permission is not granted"));
     }
     let dock = unsafe { AXUIElement::new_application(dock_pid as libc::pid_t) };
     unsafe { dock.set_messaging_timeout(2.0) };
-    let list = children(&dock).into_iter().find(|e| string(e, "AXRole").as_deref() == Some("AXList")).ok_or_else(|| anyhow!("Dock のタイルの一覧が見つかりません"))?;
+    let list = children(&dock).into_iter().find(|e| string(e, "AXRole").as_deref() == Some("AXList")).ok_or_else(|| anyhow!("{}", l!("Dock のタイルの一覧が見つかりません", "The list of Dock tiles was not found")))?;
     let want = app.canonicalize()?;
     Ok(children(&list).into_iter().find(|t| {
         tile_path(t).is_some_and(|p| p.canonicalize().ok().as_deref() == Some(want.as_path()))
@@ -93,16 +93,16 @@ fn choose(tile: &AXUIElement, what: &str, pick: impl FnOnce(&[CFRetained<AXUIEle
     let options = dock_strings("OPTIONS")?;
     perform(tile, "AXShowMenu")?;
     let menu = wait_for(Duration::from_secs(1), || children(tile).into_iter().find(|e| string(e, "AXRole").as_deref() == Some("AXMenu")))
-        .ok_or_else(|| anyhow!("タイルのメニューが開きません"))?;
+        .ok_or_else(|| anyhow!("{}", l!("タイルのメニューが開きません", "The tile's menu does not open")))?;
     let result = (|| {
         let items = children(&menu);
         let submenu = items
             .iter()
             .find(|i| is(i, &options))
             .and_then(|i| children(i).into_iter().next())
-            .ok_or_else(|| anyhow!("メニューに「オプション」がありません(項目: {})", titles(&items)))?;
+            .ok_or_else(|| anyhow!("{}", l!("メニューに「オプション」がありません(項目: {})", "The menu has no \"Options\" item (items: {})", titles(&items))))?;
         let items = children(&submenu);
-        let target = pick(&items).ok_or_else(|| anyhow!("メニューに「{what}」がありません(項目: {})", titles(&items)))?;
+        let target = pick(&items).ok_or_else(|| anyhow!("{}", l!("メニューに「{what}」がありません(項目: {})", "The menu has no \"{what}\" item (items: {})", titles(&items))))?;
         perform(&target, "AXPress")
     })();
     if result.is_err() {
@@ -121,13 +121,13 @@ fn dock_strings(key: &str) -> Result<HashSet<String>> {
         if !file.exists() {
             continue;
         }
-        let table = plist::Value::from_file(&file).with_context(|| format!("Dock の翻訳を読めません: {}", file.display()))?;
+        let table = plist::Value::from_file(&file).with_context(|| l!("Dock の翻訳を読めません: {}", "Cannot read the Dock's translations: {}", file.display()))?;
         if let Some(v) = table.as_dictionary().and_then(|d| d.get(key)).and_then(|v| v.as_string()) {
             found.insert(v.to_string());
         }
     }
     if found.is_empty() {
-        bail!("Dock の翻訳に {key} がありません");
+        bail!("{}", l!("Dock の翻訳に {key} がありません", "The Dock's translations have no {key}"));
     }
     Ok(found)
 }
@@ -162,7 +162,7 @@ fn titles(items: &[CFRetained<AXUIElement>]) -> String {
 fn perform(e: &AXUIElement, action: &str) -> Result<()> {
     let err = unsafe { e.perform_action(&CFString::from_str(action)) };
     if err != AXError::Success {
-        bail!("{action} が失敗しました (AXError {})", err.0);
+        bail!("{}", l!("{action} が失敗しました (AXError {})", "{action} failed (AXError {})", err.0));
     }
     Ok(())
 }

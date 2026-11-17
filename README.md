@@ -7,13 +7,14 @@
 DockMorph is a macOS menu bar app that replaces other apps' icons with your own PNG or GIF. It keeps the stock Dock: no Dock replacement and no changes to the apps' signatures. With the optional animated Dock tile, a GIF keeps moving in the Dock while the app is running.
 
 > [!WARNING]
-> DockMorph is under development. The animated Dock tile relies on undocumented behavior of the Dock, so a macOS update may break it. The tested environment is **macOS 27.2 on Apple Silicon**. The app's interface is in Japanese only.
+> DockMorph is under development. The animated Dock tile relies on undocumented behavior of the Dock, so a macOS update may break it. The tested environment is **macOS 27.2 on Apple Silicon**. The interface is available in English and Japanese.
 
 ## Features
 
 - **Replace icons** shown in the Dock, Finder, and app switcher with a PNG, GIF, or other image. Images keep their aspect ratio and are fitted into a square.
 - **Reapply automatically** when an app update removes the icon (within 30 seconds), and follow the app if it moves, by Bundle ID.
 - **Restore completely.** Unregistering an app brings back the original icon.
+- **Settings screen** for language (automatic, English, or Japanese), launch at login, automatic sync, updates, and permissions. By default, DockMorph shows Japanese when your macOS language is Japanese and English otherwise.
 - **Animate the Dock tile (experimental).** A GIF plays in the app's real Dock tile, with one tile per app and the running indicator on the same tile.
 
 ## How it works

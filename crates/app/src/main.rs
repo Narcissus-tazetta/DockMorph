@@ -9,7 +9,7 @@ mod theme;
 mod ui;
 mod updater;
 
-use dockmorph_core::DockMorph;
+use dockmorph_core::{lang, tr, DockMorph, Settings};
 use futures::StreamExt;
 use gpui::{
     actions, point, px, size, App, AppContext, Application, Bounds, Entity, Global, KeyBinding, Menu, MenuItem,
@@ -28,12 +28,14 @@ struct AppState {
     window: Option<WindowHandle<MainView>>,
     menubar: MenuBar,
     updater: Option<updater::Updater>,
+    /// アプリのメニュー(cx.set_menus)を作った言語。変わったら作り直す
+    menu_japanese: bool,
 }
 
 impl Global for AppState {}
 
 fn set_dock_icon_visible(visible: bool) {
-    let mtm = MainThreadMarker::new().expect("gpui のコールバックはメインスレッドで呼ばれる");
+    let mtm = MainThreadMarker::new().expect("gpui callbacks run on the main thread");
     let policy = if visible { NSApplicationActivationPolicy::Regular } else { NSApplicationActivationPolicy::Accessory };
     NSApplication::sharedApplication(mtm).setActivationPolicy(policy);
 }
@@ -63,12 +65,31 @@ fn open_window(cx: &mut App) {
             },
             move |window, cx| cx.new(|cx| MainView::new(store, window, cx)),
         )
-        .expect("ウィンドウを開けません");
+        .expect("Cannot open the window");
     cx.global_mut::<AppState>().window = Some(handle);
     cx.activate(true);
 }
 
+fn set_app_menus(cx: &mut App) {
+    cx.set_menus(vec![
+        Menu { name: "DockMorph".into(), items: vec![MenuItem::action(tr("DockMorph を終了", "Quit DockMorph"), Quit)] },
+        Menu {
+            name: tr("ファイル", "File").into(),
+            items: vec![
+                MenuItem::action(tr("アプリを追加", "Add App"), AddApp),
+                MenuItem::action(tr("今すぐ同期", "Sync Now"), SyncNow),
+                MenuItem::separator(),
+                MenuItem::action(tr("ウィンドウを閉じる", "Close Window"), CloseWindow),
+            ],
+        },
+    ]);
+    cx.global_mut::<AppState>().menu_japanese = lang::is_japanese();
+}
+
 fn rebuild_menu(cx: &mut App) {
+    if cx.global::<AppState>().menu_japanese != lang::is_japanese() {
+        set_app_menus(cx);
+    }
     let state = cx.global::<AppState>();
     state.menubar.rebuild(state.store.read(cx), login::is_enabled(), state.updater.is_some());
 }
@@ -80,22 +101,10 @@ fn handle(command: Command, cx: &mut App) {
         Command::Sync => store.update(cx, |s, cx| s.sync(true, cx)),
         Command::Launch(id) => store.update(cx, |s, cx| s.launch(&id, cx)),
         Command::ToggleLogin => {
-            let (level, title, detail) = match login::toggle() {
-                Ok(login::Outcome::Enabled) => (Level::Success, "ログイン時に起動します", None),
-                Ok(login::Outcome::Disabled) => (Level::Info, "ログイン時に起動しません", None),
-                Ok(login::Outcome::NeedsApproval) => (
-                    Level::Warn,
-                    "ログイン項目の許可が必要です",
-                    Some("開いたシステム設定の「ログイン項目」で DockMorph をオンにしてください".to_string()),
-                ),
-                Err(e) => (Level::Error, "ログイン項目を変更できません", Some(format!("{e:#}"))),
-            };
-            store.update(cx, |s, cx| s.notify(level, title, detail, cx));
-            rebuild_menu(cx);
-            // 結果はバナーでしか伝えられないので、ウィンドウが無ければ開く
-            if level != Level::Success && level != Level::Info {
+            if store.update(cx, |s, cx| s.toggle_login(cx)) {
                 open_window(cx);
             }
+            rebuild_menu(cx);
         }
         Command::CheckUpdates => {
             if let Some(updater) = &cx.global::<AppState>().updater {
@@ -109,17 +118,23 @@ fn handle(command: Command, cx: &mut App) {
 
 fn main() -> anyhow::Result<()> {
     let dm = DockMorph::new()?;
+    // 設定が壊れていても起動はする。画面が出てから理由を伝える
+    let (settings, settings_error) = match dm.settings() {
+        Ok(settings) => (settings, None),
+        Err(e) => (Settings::default(), Some(format!("{e:#}"))),
+    };
+    lang::set(settings.language);
     let app = Application::new().with_assets(assets::Assets);
     app.on_reopen(open_window);
     app.run(move |cx: &mut App| {
-        let mtm = MainThreadMarker::new().expect("gpui のコールバックはメインスレッドで呼ばれる");
+        let mtm = MainThreadMarker::new().expect("gpui callbacks run on the main thread");
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let store = cx.new(|cx| Store::new(dm, cx));
+        let store = cx.new(|cx| Store::new(dm, settings, cx));
         let (updater, updater_error) = match updater::Updater::start() {
             Ok(updater) => (updater, None),
             Err(e) => (None, Some(format!("{e:#}"))),
         };
-        cx.set_global(AppState { store: store.clone(), window: None, menubar: MenuBar::new(mtm, tx), updater });
+        cx.set_global(AppState { store: store.clone(), window: None, menubar: MenuBar::new(mtm, tx), updater, menu_japanese: lang::is_japanese() });
         rebuild_menu(cx);
         cx.observe(&store, |_, cx| rebuild_menu(cx)).detach();
         cx.spawn(async move |cx| {
@@ -139,21 +154,7 @@ fn main() -> anyhow::Result<()> {
             KeyBinding::new("cmd-r", SyncNow, None),
             KeyBinding::new("cmd-n", AddApp, None),
         ]);
-        cx.set_menus(vec![
-            Menu {
-                name: "DockMorph".into(),
-                items: vec![MenuItem::action("DockMorph を終了", Quit)],
-            },
-            Menu {
-                name: "ファイル".into(),
-                items: vec![
-                    MenuItem::action("アプリを追加", AddApp),
-                    MenuItem::action("今すぐ同期", SyncNow),
-                    MenuItem::separator(),
-                    MenuItem::action("ウィンドウを閉じる", CloseWindow),
-                ],
-            },
-        ]);
+        set_app_menus(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.global_mut::<AppState>().window = None;
@@ -162,8 +163,11 @@ fn main() -> anyhow::Result<()> {
         })
         .detach();
 
+        if let Some(detail) = settings_error {
+            store.update(cx, |s, cx| s.notify(Level::Error, tr("設定を読み込めません", "Cannot load the settings"), Some(detail), cx));
+        }
         if let Some(detail) = updater_error {
-            store.update(cx, |s, cx| s.notify(Level::Error, "アップデートの確認を使えません", Some(detail), cx));
+            store.update(cx, |s, cx| s.notify(Level::Error, tr("アップデートの確認を使えません", "Update checking is unavailable"), Some(detail), cx));
         }
         open_window(cx);
     });

@@ -13,7 +13,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[macro_use]
+pub mod lang;
 mod dock_ax;
+mod settings;
+pub use lang::{tr, Language};
+pub use settings::Settings;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -145,8 +150,8 @@ impl Scheme {
         ws.setDefaultApplicationAtURL_toOpenURLsWithScheme_completionHandler(&url, &NSString::from_str(&self.0), Some(&done));
         match rx.recv_timeout(std::time::Duration::from_secs(30)) {
             Ok(None) => Ok(()),
-            Ok(Some(e)) => bail!("{}: の既定のアプリを切り替えられません ({}): {e}", self.0, app.display()),
-            Err(_) => bail!("{}: の既定のアプリの切り替えが終わりません ({})", self.0, app.display()),
+            Ok(Some(e)) => bail!("{}", l!("{}: の既定のアプリを切り替えられません ({}): {e}", "{}: cannot change the default app ({}): {e}", self.0, app.display())),
+            Err(_) => bail!("{}", l!("{}: の既定のアプリの切り替えが終わりません ({})", "{}: changing the default app did not finish ({})", self.0, app.display())),
         }
     }
 
@@ -184,7 +189,7 @@ impl DockMorph {
                 Self { launchers: home.join("Launchers"), home }
             }
             None => {
-                let user = PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME が未設定です"))?);
+                let user = PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("{}", l!("HOME が未設定です", "HOME is not set")))?);
                 // Raycast は ~/Library 配下のアプリを候補に出さない(実測)。Spotlight・Raycast から起動用アプリを
                 // 開けるよう、アプリの置き場所として扱われる ~/Applications に置く
                 Self { home: user.join("Library/Application Support/DockMorph"), launchers: user.join("Applications/DockMorph") }
@@ -192,6 +197,8 @@ impl DockMorph {
         })
     }
 
+    /// 登録・画像・設定を置く場所
+    pub fn home_dir(&self) -> &Path { &self.home }
     fn clones_dir(&self) -> PathBuf { self.home.join("Apps") }
     fn icons_dir(&self) -> PathBuf { self.home.join("Icons") }
     fn launchers_dir(&self) -> PathBuf { self.launchers.clone() }
@@ -201,7 +208,7 @@ impl DockMorph {
     fn dock_refreshed_marker(&self) -> PathBuf { self.home.join("dock-refreshed") }
 
     pub fn clone_path(&self, entry: &Entry) -> Result<PathBuf> {
-        let name = entry.source_path.file_name().ok_or_else(|| anyhow!("不正なパス: {:?}", entry.source_path))?;
+        let name = entry.source_path.file_name().ok_or_else(|| anyhow!("{}", l!("不正なパス: {:?}", "Invalid path: {:?}", entry.source_path)))?;
         Ok(self.clones_dir().join(name))
     }
 
@@ -220,9 +227,9 @@ impl DockMorph {
             .truncate(false)
             .write(true)
             .open(self.home.join(".lock"))
-            .with_context(|| format!("ロックファイルを開けません: {}", self.home.display()))?;
+            .with_context(|| l!("ロックファイルを開けません: {}", "Cannot open the lock file: {}", self.home.display()))?;
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            bail!("ロックを取れません: {}", std::io::Error::last_os_error());
+            bail!("{}", l!("ロックを取れません: {}", "Cannot take the lock: {}", std::io::Error::last_os_error()));
         }
         Ok(Lock(f))
     }
@@ -233,9 +240,9 @@ impl DockMorph {
         let bytes = match fs::read(&f) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-            Err(e) => return Err(e).with_context(|| format!("読めません: {}", f.display())),
+            Err(e) => return Err(e).with_context(|| l!("読めません: {}", "Cannot read: {}", f.display())),
         };
-        serde_json::from_slice(&bytes).with_context(|| format!("壊れています: {}", f.display()))
+        serde_json::from_slice(&bytes).with_context(|| l!("壊れています: {}", "Corrupted: {}", f.display()))
     }
 
     fn save_entries(&self, entries: &[Entry]) -> Result<()> {
@@ -252,25 +259,25 @@ impl DockMorph {
     fn app_info(app: &Path) -> Result<AppInfo> {
         let plist_path = app.join("Contents/Info.plist");
         let info = plist::Value::from_file(&plist_path)
-            .with_context(|| format!("アプリとして読めません: {}", app.display()))?;
-        let d = info.as_dictionary().ok_or_else(|| anyhow!("Info.plist が辞書ではありません: {}", plist_path.display()))?;
+            .with_context(|| l!("アプリとして読めません: {}", "Cannot read as an app: {}", app.display()))?;
+        let d = info.as_dictionary().ok_or_else(|| anyhow!("{}", l!("Info.plist が辞書ではありません: {}", "Info.plist is not a dictionary: {}", plist_path.display())))?;
         let s = |k: &str| d.get(k).and_then(|v| v.as_string()).unwrap_or("").to_string();
         let bundle_id = s("CFBundleIdentifier");
         if bundle_id.is_empty() {
-            bail!("CFBundleIdentifier がありません: {}", app.display());
+            bail!("{}", l!("CFBundleIdentifier がありません: {}", "CFBundleIdentifier is missing: {}", app.display()));
         }
         if !Self::single_component(&bundle_id) {
-            bail!("CFBundleIdentifier が不正です: {}", app.display());
+            bail!("{}", l!("CFBundleIdentifier が不正です: {}", "CFBundleIdentifier is invalid: {}", app.display()));
         }
         let exec = s("CFBundleExecutable");
         if !Self::single_component(&exec) {
-            bail!("CFBundleExecutable が不正です: {}", app.display());
+            bail!("{}", l!("CFBundleExecutable が不正です: {}", "CFBundleExecutable is invalid: {}", app.display()));
         }
         let executable = app.join("Contents/MacOS").join(&exec);
         let metadata = fs::metadata(&executable)
-            .with_context(|| format!("実行ファイルが見つかりません: {}", executable.display()))?;
+            .with_context(|| l!("実行ファイルが見つかりません: {}", "Executable not found: {}", executable.display()))?;
         if !metadata.is_file() {
-            bail!("実行ファイルが通常ファイルではありません: {}", executable.display());
+            bail!("{}", l!("実行ファイルが通常ファイルではありません: {}", "The executable is not a regular file: {}", executable.display()));
         }
         let mtime = metadata.modified()?
             .duration_since(std::time::UNIX_EPOCH)?
@@ -288,7 +295,7 @@ impl DockMorph {
     fn registered_app_info(app: &Path, bundle_id: &str) -> Result<AppInfo> {
         let info = Self::app_info(app)?;
         if info.bundle_id != bundle_id {
-            bail!("登録と異なるアプリです: {} (登録: {bundle_id}, 実際: {})", app.display(), info.bundle_id);
+            bail!("{}", l!("登録と異なるアプリです: {} (登録: {bundle_id}, 実際: {})", "This is a different app from the registered one: {} (registered: {bundle_id}, actual: {})", app.display(), info.bundle_id));
         }
         Ok(info)
     }
@@ -458,8 +465,8 @@ impl DockMorph {
     pub fn set_auto_rejoin(&self, bundle_id: &str, on: bool) -> Result<()> {
         let _lock = self.lock()?;
         let mut entries = self.load_entries()?;
-        let entry = entries.iter_mut().find(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("未登録です: {bundle_id}"))?;
-        let anim = entry.animation.as_mut().ok_or_else(|| anyhow!("Dock で動かす設定になっていません: {bundle_id}"))?;
+        let entry = entries.iter_mut().find(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("{}", l!("未登録です: {bundle_id}", "Not registered: {bundle_id}")))?;
+        let anim = entry.animation.as_mut().ok_or_else(|| anyhow!("{}", l!("Dock で動かす設定になっていません: {bundle_id}", "Animation in the Dock is not enabled: {bundle_id}")))?;
         anim.auto_rejoin = on;
         self.save_entries(&entries)
     }
@@ -468,17 +475,17 @@ impl DockMorph {
     /// 起動用アプリから開き直す
     pub fn rejoin(&self, bundle_id: &str) -> Result<()> {
         let entries = self.load_entries()?;
-        let entry = entries.iter().find(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("未登録です: {bundle_id}"))?;
-        let anim = entry.animation.as_ref().ok_or_else(|| anyhow!("Dock で動かす設定になっていません: {}", entry.display_name()))?;
+        let entry = entries.iter().find(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("{}", l!("未登録です: {bundle_id}", "Not registered: {bundle_id}")))?;
+        let anim = entry.animation.as_ref().ok_or_else(|| anyhow!("{}", l!("Dock で動かす設定になっていません: {}", "Animation in the Dock is not enabled: {}", entry.display_name())))?;
         if !anim.direct {
-            bail!("このアプリは本物を別に開く方式なので、タイルを 1 つにまとめられません: {}", entry.display_name());
+            bail!("{}", l!("このアプリは本物を別に開く方式なので、タイルを 1 つにまとめられません: {}", "This app opens the real app separately, so its tiles cannot be merged into one: {}", entry.display_name()));
         }
         let target = self.target_path(entry)?;
         Self::registered_app_info(&target, bundle_id)?;
         if let Some(app) = Self::running_app(&target) {
             let pid = app.processIdentifier();
             if !app.terminate() {
-                bail!("アプリに終了を頼めません: {}", entry.display_name());
+                bail!("{}", l!("アプリに終了を頼めません: {}", "Cannot ask the app to quit: {}", entry.display_name()));
             }
             // runningApplications は実行ループが回らないと更新されないので、プロセスの有無を直接見る
             let exited = (0..100).any(|_| {
@@ -486,7 +493,7 @@ impl DockMorph {
                 (unsafe { libc::kill(pid, 0) }) != 0
             });
             if !exited {
-                bail!("{} が終了しませんでした(保存の確認などが出ていないか見てください)。終了したあと、動くタイルか起動用アプリから開き直すと 1 つにまとまります", entry.display_name());
+                bail!("{}", l!("{} が終了しませんでした(保存の確認などが出ていないか見てください)。終了したあと、動くタイルか起動用アプリから開き直すと 1 つにまとまります", "{} did not quit (check for a save prompt). Once it quits, open it from the animated tile or the launcher app to get a single tile", entry.display_name()));
             }
             // 終了した直後は LaunchServices に前のプロセスの登録が残っていて、同じタイルに結び付かないことを避ける
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -501,7 +508,7 @@ impl DockMorph {
         const VERSION: &str = "Contents/Resources/dm-template";
         const PARTS: [&str; 4] = ["Contents/MacOS/DMLauncher", "Contents/PlugIns/DMAnimTile.docktileplugin", "Contents/Resources/DMIconGuard", VERSION];
         let version = fs::read(template.join(VERSION))
-            .with_context(|| format!("起動用アプリの雛形が見つかりません: {}", template.display()))?;
+            .with_context(|| l!("起動用アプリの雛形が見つかりません: {}", "Launcher app template not found: {}", template.display()))?;
         let _lock = self.lock()?;
         let mut upgraded = vec![];
         for entry in self.load_entries()? {
@@ -513,7 +520,7 @@ impl DockMorph {
                 Ok(v) if v == version => continue,
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e).with_context(|| format!("読めません: {}", anim.launcher_path.display())),
+                Err(e) => return Err(e).with_context(|| l!("読めません: {}", "Cannot read: {}", anim.launcher_path.display())),
             }
             for rel in PARTS {
                 let (from, to) = (template.join(rel), anim.launcher_path.join(rel));
@@ -525,12 +532,12 @@ impl DockMorph {
                 if to.is_dir() {
                     fs::remove_dir_all(&to)?;
                 }
-                fs::rename(&tmp, &to).with_context(|| format!("起動用アプリを更新できません: {}", to.display()))?;
+                fs::rename(&tmp, &to).with_context(|| l!("起動用アプリを更新できません: {}", "Cannot update the launcher app: {}", to.display()))?;
             }
             if let Err(e) = self.refresh_launcher(&entry, &anim.launcher_path, anim.direct) {
                 // 署名まで終わっていないものを「入れ替え済み」と見なさないよう、次回やり直させる
                 if let Err(rm) = fs::remove_file(anim.launcher_path.join(VERSION)) {
-                    eprintln!("後片付けに失敗 ({}): {rm}", anim.launcher_path.display());
+                    eprintln!("Cleanup failed ({}): {rm}", anim.launcher_path.display());
                 }
                 return Err(e);
             }
@@ -546,7 +553,7 @@ impl DockMorph {
         let pinned: Vec<String> = match Self::read_dock() {
             Ok((_, mut dock)) => Self::pinned_urls(&mut dock).unwrap_or_default(),
             Err(e) => {
-                eprintln!("Dock のピン留めを読めません: {e:#}");
+                eprintln!("Cannot read the Dock's pinned apps: {e:#}");
                 vec![]
             }
         };
@@ -578,7 +585,7 @@ impl DockMorph {
         match fs::remove_file(&cache) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("Dock のアイコンの記憶を消せません: {}", cache.display())),
+            Err(e) => return Err(e).with_context(|| l!("Dock のアイコンの記憶を消せません: {}", "Cannot clear the Dock's icon cache: {}", cache.display())),
         }
         Self::restart_dock()?;
         fs::write(self.dock_refreshed_marker(), b"")?;
@@ -590,8 +597,8 @@ impl DockMorph {
     fn unregister(path: &Path) {
         match Command::new(LSREGISTER).arg("-u").arg(path).status() {
             Ok(s) if s.success() => {}
-            Ok(s) => eprintln!("lsregister -u が失敗 ({s}): {}", path.display()),
-            Err(e) => eprintln!("lsregister を実行できません: {e}"),
+            Ok(s) => eprintln!("lsregister -u failed ({s}): {}", path.display()),
+            Err(e) => eprintln!("Cannot run lsregister: {e}"),
         }
     }
 
@@ -599,7 +606,7 @@ impl DockMorph {
         let mut buf = vec![0u8; libc::PATH_MAX as usize];
         let n = unsafe { libc::confstr(libc::_CS_DARWIN_USER_CACHE_DIR, buf.as_mut_ptr().cast(), buf.len()) };
         if n == 0 || n > buf.len() {
-            bail!("ユーザーのキャッシュの場所が分かりません: {}", std::io::Error::last_os_error());
+            bail!("{}", l!("ユーザーのキャッシュの場所が分かりません: {}", "Cannot locate the user cache directory: {}", std::io::Error::last_os_error()));
         }
         buf.truncate(n - 1);
         Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&buf)).join("com.apple.dock.iconcache"))
@@ -608,16 +615,16 @@ impl DockMorph {
     fn load_image(icon: &Path) -> Result<Retained<NSImage>> {
         let path = NSString::from_str(&icon.to_string_lossy());
         let image = NSImage::initWithContentsOfFile(NSImage::alloc(), &path)
-            .ok_or_else(|| anyhow!("画像として読めません: {}", icon.display()))?;
+            .ok_or_else(|| anyhow!("{}", l!("画像として読めません: {}", "Cannot read as an image: {}", icon.display())))?;
         // 中身が空のファイルや壊れた画像でも NSImage 自体は作れてしまう
         if image.representations().is_empty() {
-            bail!("画像として読めません: {}", icon.display());
+            bail!("{}", l!("画像として読めません: {}", "Cannot read as an image: {}", icon.display()));
         }
         Ok(image)
     }
 
     fn make_clone(source: &Path, dest: &Path, icon: &Path) -> Result<()> {
-        let parent = dest.parent().ok_or_else(|| anyhow!("親ディレクトリがありません"))?;
+        let parent = dest.parent().ok_or_else(|| anyhow!("{}", l!("親ディレクトリがありません", "There is no parent directory")))?;
         fs::create_dir_all(parent)?;
         let (staged, reservation) = Self::create_unique_file(parent, ".dockmorph-clone", "app")?;
         drop(reservation);
@@ -626,14 +633,14 @@ impl DockMorph {
             let source_c = CString::new(source.as_os_str().as_bytes())?;
             let staged_c = CString::new(staged.as_os_str().as_bytes())?;
             if unsafe { libc::clonefile(source_c.as_ptr(), staged_c.as_ptr(), 0) } != 0 {
-                bail!("クローン失敗 ({}): {} → {}", std::io::Error::last_os_error(), source.display(), dest.display());
+                bail!("{}", l!("クローン失敗 ({}): {} → {}", "Clone failed ({}): {} → {}", std::io::Error::last_os_error(), source.display(), dest.display()));
             }
             Self::apply_icon(icon, &staged)?;
             if dest.exists() {
                 // 作成やアイコン設定の失敗で、動いていた旧クローンまで失わないよう最後に原子的に交換する。
                 let dest_c = CString::new(dest.as_os_str().as_bytes())?;
                 if unsafe { libc::renamex_np(staged_c.as_ptr(), dest_c.as_ptr(), libc::RENAME_SWAP) } != 0 {
-                    return Err(std::io::Error::last_os_error()).context("クローンを入れ替えられません");
+                    return Err(std::io::Error::last_os_error()).context(tr("クローンを入れ替えられません", "Cannot swap in the clone"));
                 }
             } else {
                 fs::rename(&staged, dest)?;
@@ -642,7 +649,7 @@ impl DockMorph {
         })();
         if staged.exists() {
             if let Err(e) = fs::remove_dir_all(&staged) {
-                eprintln!("クローンの一時ファイルを消せません ({}): {e}", staged.display());
+                eprintln!("Cannot remove the clone's temporary file ({}): {e}", staged.display());
             }
         }
         result
@@ -672,15 +679,15 @@ impl DockMorph {
             NSWorkspaceIconCreationOptions::empty(),
         );
         if !ok {
-            bail!("アイコン設定に失敗 (書き込み権限または App Management の許可が必要な可能性): {}", app.display());
+            bail!("{}", l!("アイコン設定に失敗 (書き込み権限または App Management の許可が必要な可能性): {}", "Failed to set the icon (write permission or App Management permission may be required): {}", app.display()));
         }
         // setIcon が true を返しても、Finder が読むフラグが立っていなければ表示されない
         if !Self::has_custom_icon(app) {
             // 中途半端な Icon\r を残すと、次回 add の「既にカスタムアイコンあり」判定に引っかかる
             if let Err(e) = Self::clear_icon(app) {
-                eprintln!("後片付けに失敗: {e:#}");
+                eprintln!("Cleanup failed: {e:#}");
             }
-            bail!("アイコンを書き込んだのにカスタムアイコンとして認識されていません: {}", app.display());
+            bail!("{}", l!("アイコンを書き込んだのにカスタムアイコンとして認識されていません: {}", "The icon was written but is not recognized as a custom icon: {}", app.display()));
         }
         Ok(())
     }
@@ -692,7 +699,7 @@ impl DockMorph {
             NSWorkspaceIconCreationOptions::empty(),
         );
         if !ok {
-            bail!("アイコンの解除に失敗: {}", app.display());
+            bail!("{}", l!("アイコンの解除に失敗: {}", "Failed to remove the icon: {}", app.display()));
         }
         Ok(())
     }
@@ -713,10 +720,10 @@ impl DockMorph {
             Bool::YES
         });
         let flat = NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(side, side), false, &handler);
-        let tiff = flat.TIFFRepresentation().ok_or_else(|| anyhow!("アイコンを書き出せません: {}", app.display()))?;
-        let rep = NSBitmapImageRep::imageRepWithData(&tiff).ok_or_else(|| anyhow!("アイコンを読み直せません: {}", app.display()))?;
+        let tiff = flat.TIFFRepresentation().ok_or_else(|| anyhow!("{}", l!("アイコンを書き出せません: {}", "Cannot export the icon: {}", app.display())))?;
+        let rep = NSBitmapImageRep::imageRepWithData(&tiff).ok_or_else(|| anyhow!("{}", l!("アイコンを読み直せません: {}", "Cannot reload the icon: {}", app.display())))?;
         let png = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) }
-            .ok_or_else(|| anyhow!("アイコンを PNG にできません: {}", app.display()))?;
+            .ok_or_else(|| anyhow!("{}", l!("アイコンを PNG にできません: {}", "Cannot convert the icon to PNG: {}", app.display())))?;
         Ok(png.to_vec())
     }
 
@@ -733,17 +740,17 @@ impl DockMorph {
     pub fn add(&self, source: &Path, image: &Path, force_clone: bool) -> Result<AddResult> {
         let _lock = self.lock()?;
         let mut entries = self.load_entries()?;
-        let source = source.canonicalize().with_context(|| format!("アプリのパスを解決できません: {}", source.display()))?;
+        let source = source.canonicalize().with_context(|| l!("アプリのパスを解決できません: {}", "Cannot resolve the app path: {}", source.display()))?;
         let source = source.as_path();
         let info = Self::app_info(source)?;
         if entries.iter().any(|e| e.bundle_id == info.bundle_id) {
-            bail!("登録済みです: {} (画像を変えるなら set-image か、画面の「画像を変更」を使ってください)", info.bundle_id);
+            bail!("{}", l!("登録済みです: {} (画像を変えるなら set-image か、画面の「画像を変更」を使ってください)", "Already registered: {} (to change the image, use set-image or \"Change Image\" in the app)", info.bundle_id));
         }
         // 何かを書き換える前に検証する。途中で失敗して孤立したファイルを残さないため
         Self::load_image(image)?;
         if !force_clone && Self::has_custom_icon(source) {
             // 既存のカスタムアイコンを黙って上書きすると remove で元に戻せなくなる
-            bail!("既にカスタムアイコンが設定されています。Finder の「情報を見る」で外してから追加してください: {}", source.display());
+            bail!("{}", l!("既にカスタムアイコンが設定されています。Finder の「情報を見る」で外してから追加してください: {}", "A custom icon is already set. Remove it with Get Info in Finder, then add the app: {}", source.display()));
         }
 
         let stored = self.store_image(&info.bundle_id, image)?;
@@ -768,7 +775,7 @@ impl DockMorph {
                 let clone = self.clone_path(&entry)?;
                 // 複製はファイル名で置くので、同名の別アプリの複製を消して作り直してしまわないよう止める
                 if let Some(other) = entries.iter().find(|e| e.mode == Mode::Clone && self.clone_path(e).ok().as_ref() == Some(&clone)) {
-                    bail!("同じ名前のアプリ ({}) がクローン方式で登録済みです: {}", other.bundle_id, clone.display());
+                    bail!("{}", l!("同じ名前のアプリ ({}) がクローン方式で登録済みです: {}", "An app with the same name ({}) is already registered with the clone method: {}", other.bundle_id, clone.display()));
                 }
                 Self::make_clone(source, &clone, &stored)?;
             }
@@ -783,7 +790,7 @@ impl DockMorph {
             Ok(fallback_reason) => Ok(AddResult { entry, fallback_reason }),
             Err(e) => {
                 if let Err(rm) = fs::remove_file(&stored) {
-                    eprintln!("後片付けに失敗 ({}): {rm}", stored.display());
+                    eprintln!("Cleanup failed ({}): {rm}", stored.display());
                 }
                 Err(e)
             }
@@ -793,7 +800,7 @@ impl DockMorph {
     /// 差し替えのたびに別名で保存する。同じパスに上書きすると、GUI がパスをキーに持つ画像キャッシュで古い画像を出し続ける
     fn store_image(&self, bundle_id: &str, image: &Path) -> Result<PathBuf> {
         if !Self::single_component(bundle_id) {
-            bail!("CFBundleIdentifier が不正です");
+            bail!("{}", l!("CFBundleIdentifier が不正です", "CFBundleIdentifier is invalid"));
         }
         fs::create_dir_all(self.icons_dir())?;
         let ext = image.extension().and_then(|e| e.to_str()).unwrap_or("png").to_lowercase();
@@ -806,9 +813,9 @@ impl DockMorph {
         })();
         if let Err(e) = result {
             if let Err(rm) = fs::remove_file(&stored) {
-                eprintln!("後片付けに失敗 ({}): {rm}", stored.display());
+                eprintln!("Cleanup failed ({}): {rm}", stored.display());
             }
-            return Err(e).with_context(|| format!("画像をコピーできません: {}", image.display()));
+            return Err(e).with_context(|| l!("画像をコピーできません: {}", "Cannot copy the image: {}", image.display()));
         }
         Ok(stored)
     }
@@ -821,7 +828,7 @@ impl DockMorph {
             match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(file) => return Ok((path, file)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => sequence += 1,
-                Err(e) => return Err(e).with_context(|| format!("作成できません: {}", path.display())),
+                Err(e) => return Err(e).with_context(|| l!("作成できません: {}", "Cannot create: {}", path.display())),
             }
         }
     }
@@ -830,10 +837,10 @@ impl DockMorph {
     pub fn change_image(&self, bundle_id: &str, image: &Path) -> Result<Entry> {
         let _lock = self.lock()?;
         let mut entries = self.load_entries()?;
-        let i = entries.iter().position(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("未登録です: {bundle_id}"))?;
+        let i = entries.iter().position(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("{}", l!("未登録です: {bundle_id}", "Not registered: {bundle_id}")))?;
         let target = self.target_path(&entries[i])?;
         if !target.join("Contents/Info.plist").exists() {
-            bail!("アイコンを付ける先のアプリが見つかりません。同期してから試してください: {}", target.display());
+            bail!("{}", l!("アイコンを付ける先のアプリが見つかりません。同期してから試してください: {}", "The app to apply the icon to was not found. Sync, then try again: {}", target.display()));
         }
         Self::registered_app_info(&target, bundle_id)?;
         Self::load_image(image)?;
@@ -845,7 +852,7 @@ impl DockMorph {
             if let Err(e) = self.save_entries(&entries) {
                 // apply_icon は失敗時に Icon\r を外すので、ここでも前の画像を付け直して登録と揃える
                 if let Err(re) = Self::apply_icon(&old, &target) {
-                    eprintln!("前の画像に戻せません: {re:#}");
+                    eprintln!("Cannot restore the previous image: {re:#}");
                 }
                 return Err(e);
             }
@@ -854,22 +861,22 @@ impl DockMorph {
         if let Err(e) = result {
             if !Self::has_custom_icon(&target) {
                 if let Err(re) = Self::apply_icon(&old, &target) {
-                    eprintln!("前の画像に戻せません: {re:#}");
+                    eprintln!("Cannot restore the previous image: {re:#}");
                 }
             }
             if let Err(rm) = fs::remove_file(&stored) {
-                eprintln!("後片付けに失敗 ({}): {rm}", stored.display());
+                eprintln!("Cleanup failed ({}): {rm}", stored.display());
             }
             return Err(e);
         }
         if let Err(rm) = fs::remove_file(&old) {
             if rm.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("前の画像を消せません ({}): {rm}", old.display());
+                eprintln!("Cannot remove the previous image ({}): {rm}", old.display());
             }
         }
         if let Some(anim) = &entries[i].animation {
             self.refresh_launcher(&entries[i], &anim.launcher_path, anim.direct)
-                .context("アイコンは変えましたが、Dock の動くタイルを更新できません")?;
+                .context(tr("アイコンは変えましたが、Dock の動くタイルを更新できません", "The icon was changed, but the animated Dock tile could not be updated"))?;
         }
         Ok(entries[i].clone())
     }
@@ -879,14 +886,14 @@ impl DockMorph {
         match entry.mode {
             Mode::InPlace => {
                 if let Err(e) = Self::clear_icon(&entry.source_path) {
-                    eprintln!("後片付けに失敗: {e:#}");
+                    eprintln!("Cleanup failed: {e:#}");
                 }
             }
             Mode::Clone => {
                 if let Ok(clone) = self.clone_path(entry) {
                     Self::unregister(&clone);
                     if let Err(e) = fs::remove_dir_all(&clone) {
-                        eprintln!("後片付けに失敗 ({}): {e}", clone.display());
+                        eprintln!("Cleanup failed ({}): {e}", clone.display());
                     }
                 }
             }
@@ -897,7 +904,7 @@ impl DockMorph {
     pub fn remove(&self, bundle_id: &str) -> Result<Option<String>> {
         let _lock = self.lock()?;
         let mut entries = self.load_entries()?;
-        let i = entries.iter().position(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("未登録です: {bundle_id}"))?;
+        let i = entries.iter().position(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("{}", l!("未登録です: {bundle_id}", "Not registered: {bundle_id}")))?;
         let entry = entries[i].clone();
         let target = self.target_path(&entry)?;
         if target.exists() {
@@ -919,7 +926,7 @@ impl DockMorph {
             Mode::Clone => {
                 let clone = self.clone_path(&entry)?;
                 if Self::is_running(&clone) {
-                    bail!("クローンが起動中です。終了してから実行してください: {}", clone.display());
+                    bail!("{}", l!("クローンが起動中です。終了してから実行してください: {}", "The clone is running. Quit it and try again: {}", clone.display()));
                 }
                 if clone.exists() {
                     Self::unregister(&clone);
@@ -931,7 +938,7 @@ impl DockMorph {
         self.save_entries(&entries)?;
         if entry.icon_path.exists() {
             if let Err(e) = fs::remove_file(&entry.icon_path) {
-                let detail = format!("登録は削除しましたが、保存画像を消せません ({}): {e}", entry.icon_path.display());
+                let detail = l!("登録は削除しましたが、保存画像を消せません ({}): {e}", "The registration was removed, but the saved image could not be deleted ({}): {e}", entry.icon_path.display());
                 eprintln!("{detail}");
                 warning = Some(match warning {
                     Some(previous) => format!("{previous}。{detail}"),
@@ -967,9 +974,9 @@ impl DockMorph {
         if !entry.source_path.join("Contents/Info.plist").exists() {
             let found = self
                 .locate_app(&id)
-                .ok_or_else(|| anyhow!("元のアプリが見つかりません (削除または移動された可能性): {}", entry.source_path.display()))?;
+                .ok_or_else(|| anyhow!("{}", l!("元のアプリが見つかりません (削除または移動された可能性): {}", "The original app was not found (it may have been deleted or moved): {}", entry.source_path.display())))?;
             if entry.mode == Mode::Clone && found.file_name() != entry.source_path.file_name() {
-                bail!("元のアプリの名前が変わったため追従できません。登録し直してください: {}", found.display());
+                bail!("{}", l!("元のアプリの名前が変わったため追従できません。登録し直してください: {}", "The original app was renamed, so it cannot be followed. Register it again: {}", found.display()));
             }
             entry.source_path = found.clone();
             relocated = Some(found);
@@ -1007,15 +1014,15 @@ impl DockMorph {
         }
         if let Some(anim) = &entry.animation {
             if !anim.launcher_path.join("Contents/Info.plist").exists() {
-                bail!("Dock で動かすための起動用アプリが見つかりません。「Dock で動かす」をオフにしてからオンにし直してください: {}", anim.launcher_path.display());
+                bail!("{}", l!("Dock で動かすための起動用アプリが見つかりません。「Dock で動かす」をオフにしてからオンにし直してください: {}", "The launcher app for animating in the Dock was not found. Turn \"Animate in the Dock\" off and on again: {}", anim.launcher_path.display()));
             }
             let target = self.target_path(entry)?;
             let tile_image = anim.launcher_path.join("Contents/Resources/tile-image");
             let image_matches = match fs::read(&tile_image) {
                 Ok(bytes) => bytes == fs::read(&entry.icon_path)
-                    .with_context(|| format!("画像を読めません: {}", entry.icon_path.display()))?,
+                    .with_context(|| l!("画像を読めません: {}", "Cannot read the image: {}", entry.icon_path.display()))?,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                Err(e) => return Err(e).with_context(|| format!("画像を読めません: {}", tile_image.display())),
+                Err(e) => return Err(e).with_context(|| l!("画像を読めません: {}", "Cannot read the image: {}", tile_image.display())),
             };
             if Self::launcher_target(&anim.launcher_path).as_deref() != Some(target.as_path()) || !image_matches {
                 self.refresh_launcher(entry, &anim.launcher_path, anim.direct)?;
@@ -1032,15 +1039,15 @@ impl DockMorph {
     /// 置き場所が変わる前に作られた起動用アプリを今の置き場所へ移し、Dock のピン留めも付け替える
     fn move_launcher(&self, entry: &mut Entry) -> Result<()> {
         let Some(anim) = entry.animation.as_mut() else { return Ok(()) };
-        let name = anim.launcher_path.file_name().ok_or_else(|| anyhow!("不正なパス: {:?}", anim.launcher_path))?;
+        let name = anim.launcher_path.file_name().ok_or_else(|| anyhow!("{}", l!("不正なパス: {:?}", "Invalid path: {:?}", anim.launcher_path)))?;
         let dest = self.launchers_dir().join(name);
         if dest.exists() {
-            bail!("起動用アプリを移せません。移し先に同じ名前のものがあります: {}", dest.display());
+            bail!("{}", l!("起動用アプリを移せません。移し先に同じ名前のものがあります: {}", "Cannot move the launcher app. Something with the same name exists at the destination: {}", dest.display()));
         }
         fs::create_dir_all(self.launchers_dir())?;
         Self::unregister(&anim.launcher_path);
         fs::rename(&anim.launcher_path, &dest)
-            .with_context(|| format!("起動用アプリを移せません: {} → {}", anim.launcher_path.display(), dest.display()))?;
+            .with_context(|| l!("起動用アプリを移せません: {} → {}", "Cannot move the launcher app: {} → {}", anim.launcher_path.display(), dest.display()))?;
         anim.launcher_path = dest.clone();
         Self::run(Command::new(LSREGISTER).arg("-f").arg(&dest))?;
         let id = Self::launcher_id(&entry.bundle_id);
@@ -1068,7 +1075,7 @@ impl DockMorph {
 
     fn file_url(path: &Path) -> Result<String> {
         let url = objc2_foundation::NSURL::fileURLWithPath_isDirectory(&NSString::from_str(&path.to_string_lossy()), true);
-        Ok(url.absoluteString().ok_or_else(|| anyhow!("URL にできません: {}", path.display()))?.to_string())
+        Ok(url.absoluteString().ok_or_else(|| anyhow!("{}", l!("URL にできません: {}", "Cannot convert to a URL: {}", path.display())))?.to_string())
     }
 
     fn launcher_target(launcher: &Path) -> Option<PathBuf> {
@@ -1077,9 +1084,9 @@ impl DockMorph {
     }
 
     fn run(cmd: &mut Command) -> Result<()> {
-        let output = cmd.output().with_context(|| format!("実行できません: {cmd:?}"))?;
+        let output = cmd.output().with_context(|| l!("実行できません: {cmd:?}", "Cannot run: {cmd:?}"))?;
         if !output.status.success() {
-            bail!("失敗 ({}): {cmd:?} {}", output.status, String::from_utf8_lossy(&output.stderr).trim());
+            bail!("{}", l!("失敗 ({}): {cmd:?} {}", "Failed ({}): {cmd:?} {}", output.status, String::from_utf8_lossy(&output.stderr).trim()));
         }
         Ok(())
     }
@@ -1124,7 +1131,7 @@ impl DockMorph {
         let resources = launcher.join("Contents/Resources");
         fs::create_dir_all(&resources)?;
         let tmp = resources.join("tile-image.tmp");
-        fs::copy(&entry.icon_path, &tmp).with_context(|| format!("画像をコピーできません: {}", entry.icon_path.display()))?;
+        fs::copy(&entry.icon_path, &tmp).with_context(|| l!("画像をコピーできません: {}", "Cannot copy the image: {}", entry.icon_path.display()))?;
         fs::rename(&tmp, resources.join("tile-image"))?;
         // codesign は Icon\r や FinderInfo の付いたバンドルを署名しないので、付け直しの前に一度外す
         if Self::has_custom_icon(launcher) {
@@ -1147,7 +1154,7 @@ impl DockMorph {
         let plist = match plist::Value::from_file(info_plist) {
             Ok(p) => p,
             Err(e) if e.as_io().is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) => return Ok(vec![]),
-            Err(e) => return Err(e).with_context(|| format!("読めません: {}", info_plist.display())),
+            Err(e) => return Err(e).with_context(|| l!("読めません: {}", "Cannot read: {}", info_plist.display())),
         };
         let mut schemes = vec![];
         let types = plist.as_dictionary().and_then(|d| d.get("CFBundleURLTypes")).and_then(|v| v.as_array());
@@ -1177,9 +1184,9 @@ impl DockMorph {
     fn read_dock() -> Result<(Vec<u8>, plist::Value)> {
         let output = Command::new("/usr/bin/defaults").args(["export", "com.apple.dock", "-"]).output()?;
         if !output.status.success() {
-            bail!("Dock の設定を読めません ({}): {}", output.status, String::from_utf8_lossy(&output.stderr).trim());
+            bail!("{}", l!("Dock の設定を読めません ({}): {}", "Cannot read the Dock settings ({}): {}", output.status, String::from_utf8_lossy(&output.stderr).trim()));
         }
-        let value = plist::Value::from_reader(std::io::Cursor::new(&output.stdout)).context("Dock の設定を解釈できません")?;
+        let value = plist::Value::from_reader(std::io::Cursor::new(&output.stdout)).context(tr("Dock の設定を解釈できません", "Cannot parse the Dock settings"))?;
         Ok((output.stdout, value))
     }
 
@@ -1215,7 +1222,7 @@ impl DockMorph {
                 return Ok(());
             }
         }
-        bail!("Dock が再起動しません")
+        bail!("{}", l!("Dock が再起動しません", "The Dock did not restart"))
     }
 
     /// 起動して間もない Dock は、終了させられるときに自分の状態を書き戻して、直前に書いた設定を消す(実測。
@@ -1268,11 +1275,11 @@ impl DockMorph {
     }
 
     fn persistent_apps(dock: &mut plist::Value) -> Result<&mut Vec<plist::Value>> {
-        let d = dock.as_dictionary_mut().ok_or_else(|| anyhow!("Dock の設定が辞書ではありません"))?;
+        let d = dock.as_dictionary_mut().ok_or_else(|| anyhow!("{}", l!("Dock の設定が辞書ではありません", "The Dock settings are not a dictionary")))?;
         if !d.contains_key("persistent-apps") {
             d.insert("persistent-apps".into(), plist::Value::Array(vec![]));
         }
-        d.get_mut("persistent-apps").and_then(|v| v.as_array_mut()).ok_or_else(|| anyhow!("Dock のピン留めが配列ではありません"))
+        d.get_mut("persistent-apps").and_then(|v| v.as_array_mut()).ok_or_else(|| anyhow!("{}", l!("Dock のピン留めが配列ではありません", "The Dock's pinned apps are not an array")))
     }
 
     /// Dock は再起動の直後などに自分の状態を書き戻すことがあり、書き込んだ設定が消えることがある(実測)。
@@ -1285,9 +1292,9 @@ impl DockMorph {
             if applied(Self::persistent_apps(&mut dock)?) {
                 return Ok(result);
             }
-            eprintln!("Dock の設定が反映されなかったのでやり直します");
+            eprintln!("The Dock settings were not applied, so retrying");
         }
-        bail!("Dock の設定を書き換えられません(Dock が書き戻してしまいます)")
+        bail!("{}", l!("Dock の設定を書き換えられません(Dock が書き戻してしまいます)", "Cannot rewrite the Dock settings (the Dock writes them back)"))
     }
 
     /// 本物がピン留めされていればその位置を置き換え、なければ末尾に足す。置き換えたら true
@@ -1309,7 +1316,7 @@ impl DockMorph {
     /// 起動中のタイルを出し、そのメニューの「Dock に残す」を押す。設定上はアプリの並びの末尾に付く。
     /// 本物がピン留めされていたら、そちらはメニューで外す
     fn pin_by_menu(&self, entry: &Entry, launcher: &Path) -> Result<()> {
-        let pid = Self::dock_pid().ok_or_else(|| anyhow!("Dock が起動していません"))?;
+        let pid = Self::dock_pid().ok_or_else(|| anyhow!("{}", l!("Dock が起動していません", "The Dock is not running")))?;
         let launcher_url = Self::file_url(launcher)?;
         let id = Self::launcher_id(&entry.bundle_id);
         Self::run(Command::new("/usr/bin/open").args(["-g", "-n"]).arg(launcher).args(["--args", "--dm-hold"]))?;
@@ -1317,7 +1324,7 @@ impl DockMorph {
             let start = std::time::Instant::now();
             while !dock_ax::keep(pid, launcher)? {
                 if start.elapsed() > std::time::Duration::from_secs(10) {
-                    bail!("起動用アプリのタイルが Dock に出ません");
+                    bail!("{}", l!("起動用アプリのタイルが Dock に出ません", "The launcher app's tile does not appear in the Dock"));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
@@ -1335,7 +1342,7 @@ impl DockMorph {
                 continue;
             }
             if !dock_ax::unpin(pid, &real)? {
-                bail!("Dock に本物のタイルが見つかりません: {}", real.display());
+                bail!("{}", l!("Dock に本物のタイルが見つかりません: {}", "The real app's tile was not found in the Dock: {}", real.display()));
             }
             Self::wait_pinned(|apps| !apps.iter().any(|t| Self::tile_matches(t, "", &url)))?;
         }
@@ -1352,7 +1359,7 @@ impl DockMorph {
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
-        bail!("メニューを操作しましたが、Dock の設定に反映されません")
+        bail!("{}", l!("メニューを操作しましたが、Dock の設定に反映されません", "The menu was operated, but the Dock settings did not change"))
     }
 
     fn pids_running(executable: &Path) -> Vec<i32> {
@@ -1418,8 +1425,7 @@ impl DockMorph {
                 Ok(()) if keep_dock => {
                     // 起動中の本物のタイルなら、メニューでピン留めに戻せる
                     let kept = Self::dock_pid().is_some_and(|pid| dock_ax::keep(pid, &entry.source_path).unwrap_or(false));
-                    return Ok((!kept).then(|| format!(
-                        "起動中のほかの動くタイルを分けないよう Dock を再起動しなかったので、{} を Dock に戻していません。必要なら Dock に置き直してください",
+                    return Ok((!kept).then(|| l!("起動中のほかの動くタイルを分けないよう Dock を再起動しなかったので、{} を Dock に戻していません。必要なら Dock に置き直してください", "To avoid splitting other running animated tiles, the Dock was not restarted, so {} was not put back in the Dock. Place it in the Dock again if you need it",
                         entry.display_name()
                     )));
                 }
@@ -1428,9 +1434,9 @@ impl DockMorph {
                     let hint = if dock_ax::trusted() {
                         String::new()
                     } else {
-                        "。システム設定 › プライバシーとセキュリティ › アクセシビリティで DockMorph を許可すると、再起動せずに外せます".into()
+                        tr("。システム設定 › プライバシーとセキュリティ › アクセシビリティで DockMorph を許可すると、再起動せずに外せます", ". Allow DockMorph in System Settings › Privacy & Security › Accessibility to remove it without restarting").into()
                     };
-                    fallback = Some(format!("Dock のメニューから外せなかったので、Dock を再起動して外しました({e:#}){hint}"));
+                    fallback = Some(l!("Dock のメニューから外せなかったので、Dock を再起動して外しました({e:#}){hint}", "The tile could not be removed from the Dock menu, so the Dock was restarted to remove it ({e:#}){hint}"));
                 }
             }
         }
@@ -1443,9 +1449,9 @@ impl DockMorph {
     }
 
     fn unpin_by_menu(&self, anim: &Animation, id: &str, launcher_url: &str) -> Result<()> {
-        let pid = Self::dock_pid().ok_or_else(|| anyhow!("Dock が起動していません"))?;
+        let pid = Self::dock_pid().ok_or_else(|| anyhow!("{}", l!("Dock が起動していません", "The Dock is not running")))?;
         if !dock_ax::unpin(pid, &anim.launcher_path)? {
-            bail!("Dock に起動用アプリのタイルが見つかりません");
+            bail!("{}", l!("Dock に起動用アプリのタイルが見つかりません", "The launcher app's tile was not found in the Dock"));
         }
         Self::wait_pinned(|apps| !apps.iter().any(|t| Self::tile_matches(t, id, launcher_url)))
     }
@@ -1475,7 +1481,7 @@ impl DockMorph {
             Self::release_schemes(entry, &anim.launcher_path)?;
             Self::unregister(&anim.launcher_path);
             fs::remove_dir_all(&anim.launcher_path)
-                .with_context(|| format!("起動用アプリを消せません: {}", anim.launcher_path.display()))?;
+                .with_context(|| l!("起動用アプリを消せません: {}", "Cannot delete the launcher app: {}", anim.launcher_path.display()))?;
         }
         Ok(warning)
     }
@@ -1486,19 +1492,19 @@ impl DockMorph {
     pub fn enable_animation(&self, bundle_id: &str, template: &Path, pin: bool) -> Result<AnimationResult> {
         let _lock = self.lock()?;
         let mut entries = self.load_entries()?;
-        let i = entries.iter().position(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("未登録です: {bundle_id}"))?;
+        let i = entries.iter().position(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("{}", l!("未登録です: {bundle_id}", "Not registered: {bundle_id}")))?;
         if entries[i].animation.is_some() {
-            bail!("すでにオンです: {}", entries[i].display_name());
+            bail!("{}", l!("すでにオンです: {}", "Already on: {}", entries[i].display_name()));
         }
         Self::registered_app_info(&entries[i].source_path, bundle_id)?;
         Self::registered_app_info(&self.target_path(&entries[i])?, bundle_id)?;
         if !template.join("Contents/PlugIns/DMAnimTile.docktileplugin/Contents/MacOS/DMAnimTile").exists() {
-            bail!("起動用アプリの雛形が見つかりません。DockMorph.app から起動してください: {}", template.display());
+            bail!("{}", l!("起動用アプリの雛形が見つかりません。DockMorph.app から起動してください: {}", "Launcher app template not found. Launch from DockMorph.app: {}", template.display()));
         }
-        let name = entries[i].source_path.file_name().ok_or_else(|| anyhow!("不正なパス: {:?}", entries[i].source_path))?;
+        let name = entries[i].source_path.file_name().ok_or_else(|| anyhow!("{}", l!("不正なパス: {:?}", "Invalid path: {:?}", entries[i].source_path)))?;
         let launcher = self.launchers_dir().join(name);
         if let Some(other) = entries.iter().find(|e| e.animation.as_ref().is_some_and(|a| a.launcher_path == launcher)) {
-            bail!("同じ名前のアプリ ({}) が Dock で動かす設定になっています: {}", other.bundle_id, launcher.display());
+            bail!("{}", l!("同じ名前のアプリ ({}) が Dock で動かす設定になっています: {}", "An app with the same name ({}) is already animated in the Dock: {}", other.bundle_id, launcher.display()));
         }
         if launcher.exists() {
             // 登録にないものは、前回の途中終了の残骸
@@ -1507,7 +1513,7 @@ impl DockMorph {
         }
         fs::create_dir_all(self.launchers_dir())?;
         let fallback_reason = self.protected_data(&entries[i])?.map(|p| {
-            format!("このアプリのデータは macOS に保護されていて({})、起動用アプリから直接起動するとアプリが自分のデータを読めなくなります。そのため本物を別に開く方式にしました。本物の起動中は Dock にタイルが 2 つ並びます", p.display())
+            l!("このアプリのデータは macOS に保護されていて({})、起動用アプリから直接起動するとアプリが自分のデータを読めなくなります。そのため本物を別に開く方式にしました。本物の起動中は Dock にタイルが 2 つ並びます", "This app's data is protected by macOS ({}), and launching it directly from the launcher app would stop it reading its own data. DockMorph therefore opens the real app separately, and two tiles appear in the Dock while it runs", p.display())
         });
         let direct = fallback_reason.is_none();
         let mut pinned_animation = None;
@@ -1534,11 +1540,11 @@ impl DockMorph {
                 } else if dock_ax::trusted() {
                     self.pin_by_menu(&entries[i], &launcher).map_err(|e| format!("{e:#}"))
                 } else {
-                    Err("アクセシビリティの許可がありません".into())
+                    Err(tr("アクセシビリティの許可がありません", "Accessibility permission is not granted").into())
                 };
                 match by_menu {
                     Ok(()) => {
-                        pin_note = Some("起動中のほかの動くタイルを分けないよう、Dock を再起動せずに置きました。動くタイルはいったん Dock の右側に出ていて、Dock が次に再起動したとき(ログインし直しなど)にアプリの並びの末尾へ移ります".into());
+                        pin_note = Some(tr("起動中のほかの動くタイルを分けないよう、Dock を再起動せずに置きました。動くタイルはいったん Dock の右側に出ていて、Dock が次に再起動したとき(ログインし直しなど)にアプリの並びの末尾へ移ります", "To avoid splitting other running animated tiles, the tile was placed without restarting the Dock. It appears on the right side of the Dock for now and moves to the end of the apps at the next Dock restart (for example after logging in again)").into());
                     }
                     Err(why) => {
                         anim.replaced_pin |= self.pin_launcher(&entries[i], &launcher)?;
@@ -1547,7 +1553,7 @@ impl DockMorph {
                         // 一度起動すると読み込む(実測)。本物は開かずにすぐ終了する引数で起動する
                         Self::run(Command::new("/usr/bin/open").args(["-W", "-g", "-n"]).arg(&launcher).args(["--args", "--dm-register"]))?;
                         if others {
-                            pin_note = Some(format!("Dock を再起動して置いたので、起動中のほかの動くタイルが分かれました({why})。分かれたアプリは「まとめ直す」で戻せます"));
+                            pin_note = Some(l!("Dock を再起動して置いたので、起動中のほかの動くタイルが分かれました({why})。分かれたアプリは「まとめ直す」で戻せます", "The Dock was restarted to place the tile, so other running animated tiles split ({why}). Use \"Rejoin\" to restore the split apps"));
                         }
                     }
                 }
@@ -1563,18 +1569,18 @@ impl DockMorph {
                     Ok(None) => {}
                     Err(u) => {
                         entries[i].animation = Some(anim.clone());
-                        self.save_entries(&entries).context("Dock の復元に失敗し、起動用アプリの登録も保存できません")?;
-                        return Err(e).context(format!("Dock を元に戻せません。起動用アプリと登録は保持しました。「Dock で動かす」をオフにして再試行してください: {u:#}"));
+                        self.save_entries(&entries).context(tr("Dock の復元に失敗し、起動用アプリの登録も保存できません", "Failed to restore the Dock and cannot save the launcher app's registration"))?;
+                        return Err(e).context(l!("Dock を元に戻せません。起動用アプリと登録は保持しました。「Dock で動かす」をオフにして再試行してください: {u:#}", "Cannot restore the Dock. The launcher app and registration were kept. Turn \"Animate in the Dock\" off and try again: {u:#}"));
                     }
                 }
             }
             if launcher.exists() {
                 if let Err(r) = Self::release_schemes(&entries[i], &launcher) {
-                    eprintln!("既定のアプリを本物に戻せません: {r:#}");
+                    eprintln!("Cannot restore the default app to the real app: {r:#}");
                 }
                 Self::unregister(&launcher);
                 if let Err(rm) = fs::remove_dir_all(&launcher) {
-                    eprintln!("後片付けに失敗 ({}): {rm}", launcher.display());
+                    eprintln!("Cleanup failed ({}): {rm}", launcher.display());
                 }
             }
             return Err(e);
@@ -1586,10 +1592,10 @@ impl DockMorph {
     /// 中身が本物でも本人と認められず、Firefox はプロファイルを読めなくなった(実測)。データの置き場所は
     /// アプリ次第なので、名前の一致する Application Support と entitlement の Group Containers だけを見る推定
     fn protected_data(&self, entry: &Entry) -> Result<Option<PathBuf>> {
-        let library = PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME が未設定です"))?).join("Library");
+        let library = PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("{}", l!("HOME が未設定です", "HOME is not set")))?).join("Library");
         let plist = plist::Value::from_file(entry.source_path.join("Contents/Info.plist"))
-            .with_context(|| format!("アプリとして読めません: {}", entry.source_path.display()))?;
-        let d = plist.as_dictionary().ok_or_else(|| anyhow!("Info.plist が辞書ではありません"))?;
+            .with_context(|| l!("アプリとして読めません: {}", "Cannot read as an app: {}", entry.source_path.display()))?;
+        let d = plist.as_dictionary().ok_or_else(|| anyhow!("{}", l!("Info.plist が辞書ではありません", "Info.plist is not a dictionary")))?;
         let mut names: Vec<String> = ["CFBundleName", "CFBundleDisplayName", "CFBundleExecutable"]
             .iter()
             .filter_map(|k| d.get(*k).and_then(|v| v.as_string()).map(str::to_lowercase))
@@ -1612,7 +1618,7 @@ impl DockMorph {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("読めません: {}", support.display())),
+            Err(e) => return Err(e).with_context(|| l!("読めません: {}", "Cannot read: {}", support.display())),
         }
         Ok(candidates.into_iter().find(|p| Self::has_xattr(p, c"com.apple.macl")))
     }
@@ -1628,13 +1634,13 @@ impl DockMorph {
             .args(["-d", "--entitlements", "-", "--xml"])
             .arg(app)
             .output()
-            .context("codesign を実行できません")?;
+            .context(tr("codesign を実行できません", "Cannot run codesign"))?;
         // 未署名・entitlement なしでは何も出ない(グループも使えない)
         if !output.status.success() || output.stdout.is_empty() {
             return Ok(vec![]);
         }
         let ent = plist::Value::from_reader_xml(output.stdout.as_slice())
-            .with_context(|| format!("entitlement を読めません: {}", app.display()))?;
+            .with_context(|| l!("entitlement を読めません: {}", "Cannot read the entitlements: {}", app.display()))?;
         Ok(ent
             .as_dictionary()
             .and_then(|d| d.get("com.apple.security.application-groups"))
@@ -1647,8 +1653,8 @@ impl DockMorph {
     pub fn disable_animation(&self, bundle_id: &str) -> Result<Option<String>> {
         let _lock = self.lock()?;
         let mut entries = self.load_entries()?;
-        let i = entries.iter().position(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("未登録です: {bundle_id}"))?;
-        let Some(anim) = entries[i].animation.clone() else { bail!("オンになっていません: {}", entries[i].display_name()) };
+        let i = entries.iter().position(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("{}", l!("未登録です: {bundle_id}", "Not registered: {bundle_id}")))?;
+        let Some(anim) = entries[i].animation.clone() else { bail!("{}", l!("オンになっていません: {}", "Not enabled: {}", entries[i].display_name())) };
         let warning = self.teardown_animation(&entries[i], &anim)?;
         entries[i].animation = None;
         self.save_entries(&entries)?;
@@ -1662,7 +1668,7 @@ impl DockMorph {
 
     pub fn launch(&self, bundle_id: &str) -> Result<()> {
         let entries = self.load_entries()?;
-        let entry = entries.iter().find(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("未登録です: {bundle_id}"))?;
+        let entry = entries.iter().find(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("{}", l!("未登録です: {bundle_id}", "Not registered: {bundle_id}")))?;
         Self::registered_app_info(&self.target_path(entry)?, bundle_id)?;
         // Dock で動かしているときに本物を直接開くと、本物のタイルが別に出てしまう
         let target = match &entry.animation {
@@ -1673,22 +1679,22 @@ impl DockMorph {
         let output = Command::new("/usr/bin/open").arg(&target).output()?;
         if !output.status.success() {
             bail!(
-                "起動に失敗 ({}): {} {}",
+                "{}", l!("起動に失敗 ({}): {} {}", "Failed to launch ({}): {} {}",
                 output.status,
                 target.display(),
                 String::from_utf8_lossy(&output.stderr).trim()
-            );
+            ));
         }
         Ok(())
     }
 
     pub fn reveal(&self, bundle_id: &str) -> Result<()> {
         let entries = self.load_entries()?;
-        let entry = entries.iter().find(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("未登録です: {bundle_id}"))?;
+        let entry = entries.iter().find(|e| e.bundle_id == bundle_id).ok_or_else(|| anyhow!("{}", l!("未登録です: {bundle_id}", "Not registered: {bundle_id}")))?;
         let target = self.target_path(entry)?;
         let status = Command::new("/usr/bin/open").arg("-R").arg(&target).status()?;
         if !status.success() {
-            bail!("Finder で表示できません ({status}): {}", target.display());
+            bail!("{}", l!("Finder で表示できません ({status}): {}", "Cannot reveal in Finder ({status}): {}", target.display()));
         }
         Ok(())
     }
@@ -1749,11 +1755,11 @@ mod tests {
             icon_path: fixture.0.join("missing.png"), fingerprint: "before".into(), animation: None,
         };
         dm.save_entries(&[entry.clone()]).unwrap();
-        assert!(dm.sync_entry(&mut entry).unwrap_err().to_string().contains("登録と異なるアプリ"));
-        assert!(dm.change_image("test.original", &fixture.0.join("missing.png")).unwrap_err().to_string().contains("登録と異なるアプリ"));
-        assert!(dm.remove("test.original").unwrap_err().to_string().contains("登録と異なるアプリ"));
-        assert!(dm.launch("test.original").unwrap_err().to_string().contains("登録と異なるアプリ"));
-        assert!(dm.enable_animation("test.original", &fixture.0, false).err().unwrap().to_string().contains("登録と異なるアプリ"));
+        assert!(dm.sync_entry(&mut entry).unwrap_err().to_string().contains("different app from the registered one"));
+        assert!(dm.change_image("test.original", &fixture.0.join("missing.png")).unwrap_err().to_string().contains("different app from the registered one"));
+        assert!(dm.remove("test.original").unwrap_err().to_string().contains("different app from the registered one"));
+        assert!(dm.launch("test.original").unwrap_err().to_string().contains("different app from the registered one"));
+        assert!(dm.enable_animation("test.original", &fixture.0, false).err().unwrap().to_string().contains("different app from the registered one"));
         assert_eq!(dm.load_entries().unwrap(), vec![entry]);
         assert!(!source.join("Icon\r").exists());
         assert!(DockMorph::registered_app_info(&source, "test.replacement").is_ok());
@@ -1769,7 +1775,7 @@ mod tests {
             let contents = n.to_le_bytes();
             fs::write(&image, contents).unwrap();
             let path = dm.store_image("test.sample", &image).unwrap();
-            assert!(!stored.iter().any(|(old, _)| old == &path), "保存パスが衝突: {}", path.display());
+            assert!(!stored.iter().any(|(old, _)| old == &path), "Saved path collision: {}", path.display());
             stored.push((path, contents));
         }
         for (path, contents) in stored {
@@ -1830,7 +1836,7 @@ mod tests {
         info.insert("CFBundleIdentifier".into(), "test.unrelated".into());
         info.insert("CFBundleExecutable".into(), "main".into());
         plist::Value::Dictionary(info).to_file_xml(clone.join("Contents/Info.plist")).unwrap();
-        assert!(dm.sync_entry(&mut entry).unwrap_err().to_string().contains("登録と異なるアプリ"));
+        assert!(dm.sync_entry(&mut entry).unwrap_err().to_string().contains("different app from the registered one"));
         assert_eq!(fs::read(clone.join("Contents/MacOS/main")).unwrap(), b"unrelated");
     }
 }

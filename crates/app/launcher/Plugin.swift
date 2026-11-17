@@ -43,6 +43,10 @@ final class DMAnimTilePlugin: NSObject, NSDockTilePlugIn {
     private var index = 0
     private var loadedDate: Date?
     private var generation = 0
+    /// 画面に出ていない理由。空でなければコマ送りを止める。Dock はコマごとに display() の結果を複製して縮小版を
+    /// 作り直すので(実測)、誰も見ていない間も回し続けると Dock の CPU を使い続ける
+    private var hiddenReasons: Set<String> = []
+    private var observers: [(NotificationCenter, NSObjectProtocol)] = []
 
     private var imageURL: URL {
         Bundle(for: DMAnimTilePlugin.self).bundleURL
@@ -53,11 +57,49 @@ final class DMAnimTilePlugin: NSObject, NSDockTilePlugIn {
     func setDockTile(_ dockTile: NSDockTile?) {
         generation += 1
         tile = dockTile
-        guard let dockTile else { return }
+        guard let dockTile else {
+            stopObserving()
+            return
+        }
         view.imageScaling = .scaleProportionallyUpOrDown
         dockTile.contentView = view
         reloadIfChanged()
+        if observers.isEmpty { observeVisibility() }
         step(generation)
+    }
+
+    private func observeVisibility() {
+        let workspace = NSWorkspace.shared.notificationCenter
+        let distributed = DistributedNotificationCenter.default()
+        let pairs: [(NotificationCenter, Notification.Name, String, Bool)] = [
+            (workspace, NSWorkspace.screensDidSleepNotification, "sleep", true),
+            (workspace, NSWorkspace.screensDidWakeNotification, "sleep", false),
+            // ファストユーザスイッチで別のユーザーに切り替わっている間
+            (workspace, NSWorkspace.sessionDidResignActiveNotification, "session", true),
+            (workspace, NSWorkspace.sessionDidBecomeActiveNotification, "session", false),
+            (distributed, Notification.Name("com.apple.screenIsLocked"), "lock", true),
+            (distributed, Notification.Name("com.apple.screenIsUnlocked"), "lock", false),
+        ]
+        observers = pairs.map { center, name, reason, hidden in
+            (center, center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.setHidden(reason, hidden)
+            })
+        }
+    }
+
+    private func stopObserving() {
+        for (center, token) in observers { center.removeObserver(token) }
+        observers = []
+        hiddenReasons = []
+    }
+
+    private func setHidden(_ reason: String, _ hidden: Bool) {
+        let wasHidden = !hiddenReasons.isEmpty
+        if hidden { hiddenReasons.insert(reason) } else { hiddenReasons.remove(reason) }
+        guard wasHidden != !hiddenReasons.isEmpty else { return }
+        // 予約済みの次のコマを無効にする。再開時は止めたコマの続きから回す
+        generation += 1
+        if hiddenReasons.isEmpty { step(generation) }
     }
 
     private func reloadIfChanged() {
@@ -70,7 +112,7 @@ final class DMAnimTilePlugin: NSObject, NSDockTilePlugIn {
     }
 
     private func step(_ gen: Int) {
-        guard gen == generation, let tile else { return }
+        guard gen == generation, hiddenReasons.isEmpty, let tile else { return }
         if index == 0 { reloadIfChanged() }
         guard let frames else {
             // 起動時に画像がまだ読めなくても、後から配置・修復された画像を拾い直す。

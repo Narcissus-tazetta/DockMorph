@@ -308,21 +308,24 @@ impl DockMorph {
             .then_some(path)
     }
 
-    fn running_app(bundle: &Path) -> Option<Retained<NSRunningApplication>> {
+    /// 起動中のアプリを bundle ID で絞ってから場所で照合する。全アプリを走査すると、2 秒ごとの監視のたびに
+    /// アプリごとの LaunchServices への XPC(bundleURL・processIdentifier)と canonicalize が走り、メインスレッドが
+    /// 止まる(実測)。GUI のプロセスでは runningApplications が監視のたびに新しいオブジェクトを返すので、結果を覚えても効かない(実測)
+    fn running_app(bundle_id: &str, bundle: &Path) -> Option<Retained<NSRunningApplication>> {
         let bundle = bundle.canonicalize().ok()?;
-        NSWorkspace::sharedWorkspace().runningApplications().iter().find(|a| {
+        NSRunningApplication::runningApplicationsWithBundleIdentifier(&NSString::from_str(bundle_id)).iter().find(|a| {
             a.bundleURL().and_then(|u| u.path()).is_some_and(|p| {
                 Path::new(&p.to_string()).canonicalize().ok().as_deref() == Some(bundle.as_path())
             })
         })
     }
 
-    pub fn is_running(bundle: &Path) -> bool {
-        Self::running_app(bundle).is_some()
+    pub fn is_running(bundle_id: &str, bundle: &Path) -> bool {
+        Self::running_app(bundle_id, bundle).is_some()
     }
 
     pub fn running_process(&self, entry: &Entry) -> Option<(i32, (u64, u64))> {
-        let pid = Self::running_app(&self.target_path(entry).ok()?)?.processIdentifier();
+        let pid = Self::running_app(&entry.bundle_id, &self.target_path(entry).ok()?)?.processIdentifier();
         Some((pid, Self::process_start(pid)?))
     }
 
@@ -410,11 +413,7 @@ impl DockMorph {
     }
 
     fn dock_start() -> Option<(u64, u64)> {
-        let dock = NSWorkspace::sharedWorkspace()
-            .runningApplications()
-            .iter()
-            .find(|a| a.bundleIdentifier().is_some_and(|id| id.to_string() == "com.apple.dock"))?;
-        Self::process_start(dock.processIdentifier())
+        Self::process_start(Self::running_app("com.apple.dock", Path::new(dock_ax::DOCK_APP))?.processIdentifier())
     }
 
     /// Dock で動かしていない登録は None。
@@ -437,7 +436,7 @@ impl DockMorph {
     pub fn tile_state(&self, entry: &Entry) -> Option<TileState> {
         let anim = entry.animation.as_ref()?;
         let target = self.target_path(entry).ok()?;
-        let Some(app) = Self::running_app(&target) else { return Some(TileState::NotRunning) };
+        let Some(app) = Self::running_app(&entry.bundle_id, &target) else { return Some(TileState::NotRunning) };
         if !anim.direct {
             return Some(TileState::Split);
         }
@@ -456,7 +455,7 @@ impl DockMorph {
     pub fn just_launched_outside(&self, entry: &Entry) -> Option<i32> {
         const FRESH_SECS: u64 = 20;
         entry.animation.as_ref().filter(|a| a.direct && a.auto_rejoin)?;
-        let pid = Self::running_app(&self.target_path(entry).ok()?)?.processIdentifier();
+        let pid = Self::running_app(&entry.bundle_id, &self.target_path(entry).ok()?)?.processIdentifier();
         let (started, _) = Self::process_start(pid)?;
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
         (now.saturating_sub(started) <= FRESH_SECS && !Self::launched_by_launcher(pid)).then_some(pid)
@@ -482,7 +481,7 @@ impl DockMorph {
         }
         let target = self.target_path(entry)?;
         Self::registered_app_info(&target, bundle_id)?;
-        if let Some(app) = Self::running_app(&target) {
+        if let Some(app) = Self::running_app(bundle_id, &target) {
             let pid = app.processIdentifier();
             if !app.terminate() {
                 bail!("{}", l!("アプリに終了を頼めません: {}", "Cannot ask the app to quit: {}", entry.display_name()));
@@ -567,7 +566,7 @@ impl DockMorph {
                     return false;
                 }
                 let is_pinned = Self::file_url(&target).is_ok_and(|u| pinned.contains(&u));
-                let running_since_before = Self::running_app(&target).and_then(|a| a.launchDate()).is_some_and(|launched| {
+                let running_since_before = Self::running_app(&entry.bundle_id, &target).and_then(|a| a.launchDate()).is_some_and(|launched| {
                     let applied = applied.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.);
                     launched.timeIntervalSince1970() < applied
                 });
@@ -928,7 +927,7 @@ impl DockMorph {
             }
             Mode::Clone => {
                 let clone = self.clone_path(&entry)?;
-                if Self::is_running(&clone) {
+                if Self::is_running(&entry.bundle_id, &clone) {
                     bail!("{}", l!("クローンが起動中です。終了してから実行してください: {}", "The clone is running. Quit it and try again: {}", clone.display()));
                 }
                 if clone.exists() {
@@ -1003,7 +1002,7 @@ impl DockMorph {
                 }
                 if info.fingerprint == entry.fingerprint && exists && Self::has_custom_icon(&clone) {
                     SyncResult::UpToDate(id.clone())
-                } else if exists && Self::is_running(&clone) {
+                } else if exists && Self::is_running(&id, &clone) {
                     return Ok(SyncResult::SkippedRunning(id));
                 } else {
                     Self::make_clone(&entry.source_path, &clone, &entry.icon_path)?;

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
-const DOCK_APP: &str = "/System/Library/CoreServices/Dock.app";
+pub(crate) const DOCK_APP: &str = "/System/Library/CoreServices/Dock.app";
 
 pub fn trusted() -> bool {
     unsafe { AXIsProcessTrusted() }

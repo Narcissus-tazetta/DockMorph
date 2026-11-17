@@ -38,6 +38,31 @@ func startupFailure(_ message: String) -> Never {
     exit(1)
 }
 
+func keepRunningIcon(registry: URL) throws -> Bool {
+    struct Settings: Decodable {
+        let keepRunningIcon: Bool?
+    }
+    let settings = registry.deletingLastPathComponent().appendingPathComponent("settings.json")
+    let data: Data
+    do {
+        data = try Data(contentsOf: settings)
+    } catch CocoaError.fileReadNoSuchFile {
+        return true
+    }
+    return try JSONDecoder().decode(Settings.self, from: data).keepRunningIcon ?? true
+}
+
+func startupIconGuardEnabled() -> Bool {
+    guard let registry = info["DMRegistry"] as? String else {
+        startupFailure("起動用アプリの設定を読めません。DockMorph を起動して更新してください。")
+    }
+    do {
+        return try keepRunningIcon(registry: URL(fileURLWithPath: registry))
+    } catch {
+        startupFailure("アイコン制御の設定を読めません: \(error.localizedDescription)")
+    }
+}
+
 func execTarget() {
     guard direct, !hold, !CommandLine.arguments.contains("--dm-register"),
           let exe = Bundle(path: targetPath)?.executableURL?.resolvingSymlinksInPath().path,
@@ -48,7 +73,7 @@ func execTarget() {
     setenv("DOCKMORPH_LAUNCHER_PID", String(getpid()), 1)
     var startupArguments: [String] = []
     var iconGuard: Process?
-    if targetBundleID == "com.google.antigravity" {
+    if targetBundleID == "com.google.antigravity" && startupIconGuardEnabled() {
         let helper = Process()
         helper.executableURL = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/DMIconGuard")
         var processInfo = proc_bsdinfo()

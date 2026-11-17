@@ -7,6 +7,8 @@
 set -euo pipefail
 profile=${1:-debug}
 out=${2:-target/bundle}
+minimum_macos=14.0
+swift_target="$(uname -m)-apple-macosx$minimum_macos"
 root=${0:A:h:h}
 cd "$root"
 if [[ $profile == release ]]; then cargo build --release -p dockmorph-app; else cargo build -p dockmorph-app; fi
@@ -31,13 +33,13 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
   <key>CFBundleVersion</key><string>$build_number</string>
-  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSMinimumSystemVersion</key><string>$minimum_macos</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>CFBundleIconFile</key><string>AppIcon</string>
 </dict></plist>
 PLIST
 mkdir -p "$app/Contents/Resources"
-swiftc -O -parse-as-library -o "$app/Contents/Resources/DMIconGuard" crates/app/helpers/IconGuard.swift
+swiftc -O -target "$swift_target" -parse-as-library -o "$app/Contents/Resources/DMIconGuard" crates/app/helpers/IconGuard.swift
 iconset=$(mktemp -d)/AppIcon.iconset
 swift scripts/icon.swift crates/app/assets/menubar.svg "$iconset"
 iconutil -c icns -o "$app/Contents/Resources/AppIcon.icns" "$iconset"
@@ -47,8 +49,8 @@ tpl="$app/Contents/Resources/Launcher.app"
 plug="$tpl/Contents/PlugIns/DMAnimTile.docktileplugin"
 mkdir -p "$tpl/Contents/MacOS" "$tpl/Contents/Resources" "$plug/Contents/MacOS"
 cp "$app/Contents/Resources/DMIconGuard" "$tpl/Contents/Resources/DMIconGuard"
-swiftc -O -o "$tpl/Contents/MacOS/DMLauncher" crates/app/launcher/main.swift
-swiftc -O -emit-library -module-name DMAnimTile -o "$plug/Contents/MacOS/DMAnimTile" crates/app/launcher/Plugin.swift
+swiftc -O -target "$swift_target" -o "$tpl/Contents/MacOS/DMLauncher" crates/app/launcher/main.swift
+swiftc -O -target "$swift_target" -emit-library -module-name DMAnimTile -o "$plug/Contents/MacOS/DMAnimTile" crates/app/launcher/Plugin.swift
 cat > "$plug/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

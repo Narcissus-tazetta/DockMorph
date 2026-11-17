@@ -232,15 +232,27 @@ struct Main {
               // CLI でオフにした場合や DockMorph を終了した場合も、登録が外れたら元の動作へ戻す。
               state.timer = setInterval(() => {
                 let entries;
+                let keepRunningIcon;
                 try {
-                  entries = JSON.parse(process.mainModule.require('node:fs').readFileSync(\(registry), 'utf8'));
+                  const fs = process.mainModule.require('node:fs');
+                  const path = process.mainModule.require('node:path');
+                  entries = JSON.parse(fs.readFileSync(\(registry), 'utf8'));
                   if (!Array.isArray(entries)) throw Error('invalid registry');
+                  let settings;
+                  try {
+                    settings = JSON.parse(fs.readFileSync(path.join(path.dirname(\(registry)), 'settings.json'), 'utf8'));
+                  } catch (error) {
+                    if (error.code !== 'ENOENT') throw error;
+                    settings = {};
+                  }
+                  keepRunningIcon = settings.keepRunningIcon ?? true;
+                  if (typeof keepRunningIcon !== 'boolean') throw Error('invalid icon control setting');
                 } catch (error) {
                   restore(state);
-                  console.error('DockMorph: icon control restored because registration could not be read:', error.name);
+                  console.error('DockMorph: icon control restored because registration or settings could not be read:', error.name);
                   return;
                 }
-                if (!entries.some(entry => entry.bundleId === 'com.google.antigravity' && entry.animation?.direct)) restore(state);
+                if (!keepRunningIcon || !entries.some(entry => entry.bundleId === 'com.google.antigravity' && entry.animation?.direct)) restore(state);
               }, 2000);
               state.timer.unref();
               """ : """

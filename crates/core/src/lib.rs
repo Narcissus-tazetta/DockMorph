@@ -777,6 +777,9 @@ impl DockMorph {
                 if let Some(other) = entries.iter().find(|e| e.mode == Mode::Clone && self.clone_path(e).ok().as_ref() == Some(&clone)) {
                     bail!("{}", l!("同じ名前のアプリ ({}) がクローン方式で登録済みです: {}", "An app with the same name ({}) is already registered with the clone method: {}", other.bundle_id, clone.display()));
                 }
+                if clone.try_exists()? {
+                    bail!("{}", l!("複製の作成先に未登録のファイルがあります。別の場所へ移してから再試行してください: {}", "The clone destination contains an unregistered file. Move it elsewhere and retry: {}", clone.display()));
+                }
                 Self::make_clone(source, &clone, &stored)?;
             }
             entries.push(entry.clone());
@@ -995,7 +998,7 @@ impl DockMorph {
             Mode::Clone => {
                 let clone = self.clone_path(entry)?;
                 let exists = clone.exists();
-                if clone.join("Contents/Info.plist").exists() {
+                if exists {
                     Self::registered_app_info(&clone, &id)?;
                 }
                 if info.fingerprint == entry.fingerprint && exists && Self::has_custom_icon(&clone) {
@@ -1506,10 +1509,8 @@ impl DockMorph {
         if let Some(other) = entries.iter().find(|e| e.animation.as_ref().is_some_and(|a| a.launcher_path == launcher)) {
             bail!("{}", l!("同じ名前のアプリ ({}) が Dock で動かす設定になっています: {}", "An app with the same name ({}) is already animated in the Dock: {}", other.bundle_id, launcher.display()));
         }
-        if launcher.exists() {
-            // 登録にないものは、前回の途中終了の残骸
-            Self::unregister(&launcher);
-            fs::remove_dir_all(&launcher)?;
+        if launcher.try_exists()? {
+            bail!("{}", l!("起動用アプリの作成先に未登録のファイルがあります。別の場所へ移してから再試行してください: {}", "The launcher destination contains an unregistered file. Move it elsewhere and retry: {}", launcher.display()));
         }
         fs::create_dir_all(self.launchers_dir())?;
         let fallback_reason = self.protected_data(&entries[i])?.map(|p| {
@@ -1818,6 +1819,61 @@ mod tests {
         assert!(DockMorph::pin_tile(&mut apps, &entry, "file:///Launcher.app/", "file:///Sample.app/", "file:///Sample.app/"));
         assert!(!DockMorph::pin_tile(&mut apps, &entry, "file:///Launcher.app/", "file:///Sample.app/", "file:///Sample.app/"));
         assert_eq!(apps, vec![before, DockMorph::app_tile("file:///Launcher.app/"), after]);
+    }
+
+    #[test]
+    fn adding_clone_preserves_unregistered_destination() {
+        let fixture = Fixture::new();
+        let source = fixture.app("test.sample", "main");
+        let dm = DockMorph { home: fixture.0.clone(), launchers: fixture.0.join("Launchers") };
+        let dest = fixture.0.join("Apps/Sample.app");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("user-data"), b"preserved").unwrap();
+        let image = fixture.0.join("icon.png");
+        fs::write(&image, DockMorph::app_icon_png(&source).unwrap()).unwrap();
+        assert!(dm.add(&source, &image, true).is_err());
+        assert_eq!(fs::read(dest.join("user-data")).unwrap(), b"preserved");
+        assert!(dm.load_entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn enabling_animation_preserves_unregistered_destination() {
+        let fixture = Fixture::new();
+        let source = fixture.app("test.sample", "main");
+        let dm = DockMorph { home: fixture.0.clone(), launchers: fixture.0.join("Launchers") };
+        let dest = dm.launchers.join("Sample.app");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("user-data"), b"preserved").unwrap();
+        let entry = Entry {
+            mode: Mode::InPlace, bundle_id: "test.sample".into(), source_path: source,
+            icon_path: fixture.0.join("missing.png"), fingerprint: "1".into(), animation: None,
+        };
+        dm.save_entries(std::slice::from_ref(&entry)).unwrap();
+        let template = fixture.0.join("Template.app");
+        let plugin = template.join("Contents/PlugIns/DMAnimTile.docktileplugin/Contents/MacOS");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(plugin.join("DMAnimTile"), b"plugin").unwrap();
+        assert!(dm.enable_animation("test.sample", &template, false).is_err());
+        assert_eq!(fs::read(dest.join("user-data")).unwrap(), b"preserved");
+        assert_eq!(dm.load_entries().unwrap(), vec![entry]);
+    }
+
+    #[test]
+    fn sync_preserves_clone_destination_without_app_metadata() {
+        let fixture = Fixture::new();
+        let source = fixture.app("test.sample", "main");
+        let dm = DockMorph { home: fixture.0.clone(), launchers: fixture.0.join("Launchers") };
+        let image = fixture.0.join("icon.png");
+        fs::write(&image, DockMorph::app_icon_png(&source).unwrap()).unwrap();
+        let mut entry = Entry {
+            mode: Mode::Clone, bundle_id: "test.sample".into(), source_path: source,
+            icon_path: image, fingerprint: "old".into(), animation: None,
+        };
+        let clone = dm.clone_path(&entry).unwrap();
+        fs::create_dir_all(&clone).unwrap();
+        fs::write(clone.join("user-data"), b"preserved").unwrap();
+        assert!(dm.sync_entry(&mut entry).is_err());
+        assert_eq!(fs::read(clone.join("user-data")).unwrap(), b"preserved");
     }
 
     #[test]

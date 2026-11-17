@@ -29,6 +29,15 @@ func isRunning(executable: String) -> Bool {
 /// DockMorph が Dock のタイルのメニューで「Dock に残す」を押す間、起動中のタイルを出したままにする
 let hold = CommandLine.arguments.contains("--dm-hold")
 
+func startupFailure(_ message: String) -> Never {
+    let alert = NSAlert()
+    alert.messageText = "Antigravity を起動できません"
+    alert.informativeText = message
+    NSApplication.shared.activate(ignoringOtherApps: true)
+    alert.runModal()
+    exit(1)
+}
+
 func execTarget() {
     guard direct, !hold, !CommandLine.arguments.contains("--dm-register"),
           let exe = Bundle(path: targetPath)?.executableURL?.resolvingSymlinksInPath().path,
@@ -37,13 +46,35 @@ func execTarget() {
     // 判定できるよう、環境変数に印を残す。環境変数は、アプリが自分を起動し直したとき(更新後の再起動など)の
     // 新しいプロセスにも引き継がれる。そちらは本物のタイルに出るので、exec しても変わらない pid を値にして見分ける
     setenv("DOCKMORPH_LAUNCHER_PID", String(getpid()), 1)
+    var startupArguments: [String] = []
+    var iconGuard: Process?
+    if targetBundleID == "com.google.antigravity" {
+        let helper = Process()
+        helper.executableURL = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/DMIconGuard")
+        var processInfo = proc_bsdinfo()
+        let size = Int32(MemoryLayout.size(ofValue: processInfo))
+        let read = withUnsafeMutablePointer(to: &processInfo) { proc_pidinfo(getpid(), PROC_PIDTBSDINFO, 0, $0, size) }
+        guard read == size, let registry = info["DMRegistry"] as? String else {
+            startupFailure("起動用アプリの設定を読めません。DockMorph を起動して更新してください。")
+        }
+        // 通常の起動後ガード(9229)と競合させず、同時起動する別 PID ともポートを分ける。
+        let port = 20000 + Int(getpid()) % 40000
+        helper.arguments = ["startup", String(getpid()), String(processInfo.pbi_start_tvsec), String(processInfo.pbi_start_tvusec), targetPath, registry, String(port)]
+        do { try helper.run() } catch { startupFailure("アイコン制御を開始できません: \(error.localizedDescription)") }
+        setenv("DOCKMORPH_ICON_GUARD_PID", String(getpid()), 1)
+        iconGuard = helper
+        startupArguments = ["--inspect-brk=127.0.0.1:\(port)"]
+    }
     var args: [UnsafeMutablePointer<CChar>?] = [strdup(exe)]
-    args += CommandLine.arguments.dropFirst().map { strdup($0) }
+    args += (startupArguments + Array(CommandLine.arguments.dropFirst())).map { strdup($0) }
     args.append(nil)
     execv(exe, args)
+    let execError = errno
+    iconGuard?.terminate()
+    unsetenv("DOCKMORPH_ICON_GUARD_PID")
     unsetenv("DOCKMORPH_LAUNCHER_PID")
     // 戻ってきたら失敗。本物を開く通常の経路に回す
-    NSLog("DockMorph: exec に失敗 (\(String(cString: strerror(errno)))): \(exe)")
+    NSLog("DockMorph: exec に失敗 (\(String(cString: strerror(execError)))): \(exe)")
 }
 
 execTarget()

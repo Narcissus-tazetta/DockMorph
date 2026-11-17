@@ -198,7 +198,9 @@ impl Store {
         }
         let desired = self.items.iter().find(|i| i.entry.bundle_id == icon_guard::BUNDLE_ID && i.tile == Some(TileState::Joined)).and_then(|i| {
             let (pid, started) = self.dm.running_process(&i.entry)?;
-            Some(Process { pid, started, bundle: self.dm.target_path(&i.entry).ok()?, registry: self.dm.entries_file() })
+            // SIGUSR1 は起動時の inspector のポートを再利用する。
+            let port = if DockMorph::startup_icon_guard(pid) { (20000 + pid % 40000) as u16 } else { 9229 };
+            Some(Process { pid, started, port, bundle: self.dm.target_path(&i.entry).ok()?, registry: self.dm.entries_file() })
         });
         if desired == self.icon_guard_target && (self.icon_guard_attempted || (desired.is_none() && self.icon_guard_current.is_none())) {
             return;

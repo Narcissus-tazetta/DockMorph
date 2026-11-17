@@ -35,6 +35,7 @@ rm -rf "${iconset:h}"
 tpl="$app/Contents/Resources/Launcher.app"
 plug="$tpl/Contents/PlugIns/DMAnimTile.docktileplugin"
 mkdir -p "$tpl/Contents/MacOS" "$tpl/Contents/Resources" "$plug/Contents/MacOS"
+cp "$app/Contents/Resources/DMIconGuard" "$tpl/Contents/Resources/DMIconGuard"
 swiftc -O -o "$tpl/Contents/MacOS/DMLauncher" crates/app/launcher/main.swift
 swiftc -O -emit-library -module-name DMAnimTile -o "$plug/Contents/MacOS/DMAnimTile" crates/app/launcher/Plugin.swift
 cat > "$plug/Contents/Info.plist" <<PLIST
@@ -49,7 +50,7 @@ cat > "$plug/Contents/Info.plist" <<PLIST
 PLIST
 codesign --force -s - "$plug"
 # 作成済みの起動用アプリを入れ替えるかどうかを、DockMorph がこの印で判断する
-cat "$tpl/Contents/MacOS/DMLauncher" "$plug/Contents/MacOS/DMAnimTile" | shasum -a 256 | cut -d' ' -f1 > "$tpl/Contents/Resources/dm-template"
+cat "$tpl/Contents/MacOS/DMLauncher" "$plug/Contents/MacOS/DMAnimTile" "$tpl/Contents/Resources/DMIconGuard" | shasum -a 256 | cut -d' ' -f1 > "$tpl/Contents/Resources/dm-template"
 # ad-hoc 署名はビルドのたびに別のアプリ扱いになり、アクセシビリティの許可が外れる。証明書で署名すれば残る
 identity=${DOCKMORPH_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk '/Apple Development/ { print $2; exit }')}
 codesign --force -s "${identity:--}" "$app"

@@ -330,6 +330,14 @@ impl DockMorph {
     /// 印は子プロセスにも引き継がれる。アプリが自分を起動し直した新しいプロセス(更新後の再起動など)は本物のタイルに
     /// 出るので、印の pid が自分のものと一致するときだけ「起動用アプリが exec したプロセス」と見なす
     fn launched_by_launcher(pid: i32) -> bool {
+        Self::has_process_marker(pid, LAUNCHER_ENV)
+    }
+
+    pub fn startup_icon_guard(pid: i32) -> bool {
+        Self::has_process_marker(pid, b"DOCKMORPH_ICON_GUARD_PID=")
+    }
+
+    fn has_process_marker(pid: i32, marker: &[u8]) -> bool {
         let mut argmax: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>();
         let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
@@ -344,8 +352,8 @@ impl DockMorph {
         }
         let area = &buf[..len];
         let own = pid.to_string();
-        area.windows(LAUNCHER_ENV.len()).position(|w| w == LAUNCHER_ENV).is_some_and(|at| {
-            area[at + LAUNCHER_ENV.len()..].split(|b| *b == 0).next() == Some(own.as_bytes())
+        area.windows(marker.len()).position(|w| w == marker).is_some_and(|at| {
+            area[at + marker.len()..].split(|b| *b == 0).next() == Some(own.as_bytes())
         })
     }
 
@@ -491,7 +499,7 @@ impl DockMorph {
     pub fn upgrade_launchers(&self, template: &Path) -> Result<Vec<String>> {
         // 署名し直すと実行ファイルの中身が変わるので、中身ではなく雛形に付けた版の印で比べる
         const VERSION: &str = "Contents/Resources/dm-template";
-        const PARTS: [&str; 3] = ["Contents/MacOS/DMLauncher", "Contents/PlugIns/DMAnimTile.docktileplugin", VERSION];
+        const PARTS: [&str; 4] = ["Contents/MacOS/DMLauncher", "Contents/PlugIns/DMAnimTile.docktileplugin", "Contents/Resources/DMIconGuard", VERSION];
         let version = fs::read(template.join(VERSION))
             .with_context(|| format!("起動用アプリの雛形が見つかりません: {}", template.display()))?;
         let _lock = self.lock()?;
@@ -1093,6 +1101,7 @@ impl DockMorph {
         d.insert("DMTargetApp".into(), s(&self.target_path(entry)?.to_string_lossy()));
         d.insert("DMTargetBundleID".into(), s(&entry.bundle_id));
         d.insert("DMDirect".into(), plist::Value::Boolean(direct));
+        d.insert("DMRegistry".into(), s(&self.entries_file().to_string_lossy()));
         // 本物を別に開く方式では、受け持ってもタイルは分かれるので受け持たない
         let schemes: Vec<Scheme> = if direct {
             Self::declared_schemes(&entry.source_path.join("Contents/Info.plist"))?

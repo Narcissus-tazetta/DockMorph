@@ -12,6 +12,7 @@ pub struct Process {
     pub started: (u64, u64),
     pub bundle: PathBuf,
     pub registry: PathBuf,
+    pub port: u16,
 }
 
 pub fn update(process: &Process, restore: bool) -> Result<()> {
@@ -23,6 +24,7 @@ pub fn update(process: &Process, restore: bool) -> Result<()> {
         .arg(process.started.1.to_string())
         .arg(&process.bundle)
         .arg(&process.registry)
+        .arg(process.port.to_string())
         .output()
         .with_context(|| format!("起動中のアイコン制御を開始できません: {}", helper.display()))?;
     if !output.status.success() {

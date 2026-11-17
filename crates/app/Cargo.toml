@@ -14,5 +14,5 @@ image = "0.25"
 libc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSOpenPanel", "NSSavePanel", "NSPanel", "NSWindow", "block2", "NSApplication", "NSRunningApplication", "NSResponder", "NSImage", "NSMenu", "NSMenuItem", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSCell"] }
-objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSGeometry", "NSError", "NSArray", "NSURL", "NSThread"] }
+objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSGeometry", "NSError", "NSArray", "NSURL", "NSThread", "NSBundle"] }
 objc2-service-management = { version = "0.3", features = ["SMAppService"] }

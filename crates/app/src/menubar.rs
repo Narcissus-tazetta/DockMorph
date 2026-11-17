@@ -15,6 +15,7 @@ pub enum Command {
     Sync,
     Launch(String),
     ToggleLogin,
+    CheckUpdates,
     Quit,
 }
 
@@ -23,6 +24,7 @@ const TAG_SYNC: isize = 2;
 const TAG_LAUNCH: isize = 3;
 const TAG_LOGIN: isize = 4;
 const TAG_QUIT: isize = 5;
+const TAG_UPDATE: isize = 6;
 
 define_class!(
     // NSMenuItem の target は弱参照なので、MenuBar がこのオブジェクトを持ち続ける
@@ -38,6 +40,7 @@ define_class!(
                 TAG_OPEN => Command::Open,
                 TAG_SYNC => Command::Sync,
                 TAG_LOGIN => Command::ToggleLogin,
+                TAG_UPDATE => Command::CheckUpdates,
                 TAG_QUIT => Command::Quit,
                 TAG_LAUNCH => {
                     let Some(id) = sender.representedObject().and_then(|o| o.downcast::<NSString>().ok()) else {
@@ -122,7 +125,7 @@ impl MenuBar {
     }
 
     /// 登録や同期結果が変わるたびに作り直す。項目は数件なので差分更新より単純さを取る
-    pub fn rebuild(&self, store: &Store, login_item: Option<bool>) {
+    pub fn rebuild(&self, store: &Store, login_item: Option<bool>, updates: bool) {
         self.menu.removeAllItems();
         let issues = store.issue_count();
         self.add_label(&if store.items.is_empty() {
@@ -160,6 +163,11 @@ impl MenuBar {
                 item.setState(if on { NSControlStateValueOn } else { NSControlStateValueOff });
             }
             None => self.add_label("ログイン時に起動(.app から起動したときのみ)"),
+        }
+        if updates {
+            self.add("アップデートを確認…", TAG_UPDATE, "");
+        } else {
+            self.add_label("アップデートの確認(配布版のみ)");
         }
         self.add("DockMorph を終了", TAG_QUIT, "q");
     }

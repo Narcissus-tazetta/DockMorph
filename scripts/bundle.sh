@@ -1,11 +1,22 @@
 #!/bin/zsh
 # 使い方: scripts/bundle.sh [debug|release] [出力ディレクトリ]
+# 環境変数:
+#   DOCKMORPH_VERSION    X.Y.Z を指定すると配布用ビルド。版数を刻み、Sparkle を同梱して更新先と公開鍵を入れる
+#   SPARKLE_FRAMEWORK    配布用ビルドで使う Sparkle.framework(既定は scripts/fetch-sparkle.sh で取得)
+#   SPARKLE_FEED_URL     配布用ビルドの更新先(既定は main の docs/appcast.xml)
 set -euo pipefail
 profile=${1:-debug}
 out=${2:-target/bundle}
 root=${0:A:h:h}
 cd "$root"
 if [[ $profile == release ]]; then cargo build --release -p dockmorph-app; else cargo build -p dockmorph-app; fi
+version=${DOCKMORPH_VERSION:-0.1.0}
+build_number=1
+if [[ -n ${DOCKMORPH_VERSION:-} ]]; then
+  build_number=$(bash scripts/derive_build_number.sh "$DOCKMORPH_VERSION")
+  sparkle=${SPARKLE_FRAMEWORK:-$(scripts/fetch-sparkle.sh)}
+  [[ -d $sparkle ]] || { echo "Sparkle.framework が見つからない: $sparkle" >&2; exit 1; }
+fi
 app="$out/DockMorph.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
@@ -18,8 +29,8 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>DockMorph</string>
   <key>CFBundleExecutable</key><string>DockMorph</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>$version</string>
+  <key>CFBundleVersion</key><string>$build_number</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>CFBundleIconFile</key><string>AppIcon</string>
@@ -53,5 +64,15 @@ codesign --force -s - "$plug"
 cat "$tpl/Contents/MacOS/DMLauncher" "$plug/Contents/MacOS/DMAnimTile" "$tpl/Contents/Resources/DMIconGuard" | shasum -a 256 | cut -d' ' -f1 > "$tpl/Contents/Resources/dm-template"
 # ad-hoc 署名はビルドのたびに別のアプリ扱いになり、アクセシビリティの許可が外れる。証明書で署名すれば残る
 identity=${DOCKMORPH_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk '/Apple Development/ { print $2; exit }')}
+if [[ -n ${DOCKMORPH_VERSION:-} ]]; then
+  feed=${SPARKLE_FEED_URL:-https://raw.githubusercontent.com/Narcissus-tazetta/DockMorph/main/docs/appcast.xml}
+  mkdir -p "$app/Contents/Frameworks"
+  cp -R "$sparkle" "$app/Contents/Frameworks/"
+  /usr/libexec/PlistBuddy -c "Add :SUFeedURL string $feed" "$app/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $(tr -d '[:space:]' < scripts/sparkle-public-key.txt)" "$app/Contents/Info.plist"
+  # Sparkle は XPC と Updater.app を中に持つので、フレームワークだけ --deep で入れ子ごと署名する(アプリ本体には使わない)
+  codesign --force --deep -s "${identity:--}" "$app/Contents/Frameworks/Sparkle.framework"
+fi
 codesign --force -s "${identity:--}" "$app"
+codesign --verify --deep --strict "$app"
 echo "$app"

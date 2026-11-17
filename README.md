@@ -1,80 +1,127 @@
 # DockMorph
 
-純正の Dock を使ったまま、他のアプリのアイコンを好きな画像(PNG・GIF など)に変える macOS アプリです。メニューバーに常駐し、アプリの更新でアイコンが外れても自動で付け直します。
+**Change any app's icon to your own image, and make it animate in the native Dock.**
 
-## できること
+**English** · [日本語](README.ja.md)
 
-- **アイコンの差し替え**: 登録したアプリのアイコンを、Dock・Finder・アプリ切り替えで好きな画像にします。画像は縦横比を保ったまま正方形に収めます。
-- **自動で付け直す**: アプリの更新でアイコンが外れても、30 秒以内に付け直します。元のアプリが移動しても Bundle ID から追従します。
-- **元に戻す**: 登録を外すと、アイコンも含めて完全に元の状態に戻ります。
-- **Dock で GIF を動かす(実験的)**: 動くタイルを持つ「起動用アプリ」を作り、そこから本物を開くことで、Dock の GIF を動かします。
+DockMorph is a macOS menu bar app that replaces other apps' icons with your own PNG or GIF. It keeps the stock Dock: no Dock replacement and no changes to the apps' signatures. With the optional animated Dock tile, a GIF keeps moving in the Dock while the app is running.
 
-## 仕組み
+> [!WARNING]
+> DockMorph is under development. The animated Dock tile relies on undocumented behavior of the Dock, so a macOS update may break it. The tested environment is **macOS 27.2 on Apple Silicon**. The app's interface is in Japanese only.
 
-| 方式 | 内容 |
+## Features
+
+- **Replace icons** shown in the Dock, Finder, and app switcher with a PNG, GIF, or other image. Images keep their aspect ratio and are fitted into a square.
+- **Reapply automatically** when an app update removes the icon (within 30 seconds), and follow the app if it moves, by Bundle ID.
+- **Restore completely.** Unregistering an app brings back the original icon.
+- **Animate the Dock tile (experimental).** A GIF plays in the app's real Dock tile, with one tile per app and the running indicator on the same tile.
+
+## How it works
+
+| Method | What it does |
 | --- | --- |
-| in-place(既定) | 本物のバンドル直下に `Icon\r` を付けます。署名は有効なままです |
-| clone(フォールバック) | 本物に書き込めないとき、APFS クローンの複製にアイコンを付けて複製を起動します。方式が切り替わったときは必ず警告します |
+| In-place (default) | Attaches the custom icon (`Icon\r`) to the app bundle. The app's code signature stays valid |
+| Clone (fallback) | When the bundle is not writable, attaches the icon to an APFS clone of the app and launches the clone. DockMorph always warns when it switches to this method |
 
-### Dock で GIF を動かす
+### Animated Dock tile
 
-本物のタイルは Dock がアイコンを固定するため動かせません。そこで `~/Applications/DockMorph/<アプリ名>.app`(起動用アプリ)を作ります。
+The Dock freezes a running app's tile image, so the real app's tile cannot be animated. DockMorph instead creates a launcher app at `~/Applications/DockMorph/<App name>.app`.
 
-- 起動用アプリは Dock タイル用のプラグイン(`NSDockTilePlugIn`)で GIF を描きます。
-- 本物が未起動なら、起動用アプリが本物の実行ファイルに `execv` します。プロセスは本物のまま(署名も本物)で、Dock のタイルは 1 つのままです。
-- 本物のデータフォルダに `com.apple.macl` が付いているアプリは、`execv` だと壊れるため、本物を別に開く方式にします(警告が出ます)。
-- 本物が直接開かれて動かないタイルが分かれたときは、自動で終了して起動用アプリから開き直します(DockMorph の常駐中のみ)。
-- 本物のリンク(URL スキーム)は、起動用アプリが受け取って本物へ渡します。
-- Antigravity が元アイコンを指定し直す処理は、起動用アプリから開く際に本体の処理が始まる前から抑止します。起動後の制御は DockMorph の常駐中にも自動で適用します。本体ファイルと署名は変更しません。一時的にローカルの Electron デバッグ接続を使い、処理後に接続を閉じます。起動時は一時的な専用ポートを使い、起動後の制御にも同じポートを使います。専用ポートで起動していないプロセスの制御にはポート 9229 を使います。起動時の制御に失敗した場合は、理由を表示して起動を中止します。「Dock で動かす」をオフにすると通常どおり起動できます。起動後の制御で接続用ポートが使用中のときや、アプリの更新で接続が無効になったときは警告を表示します。「今すぐ同期」で再試行できます。オフ・登録解除時は元の動作に戻ります。
-- Dock のタイルのメニュー(オプション → Dock から削除 / Dock に残す)を操作して、Dock を再起動せずに動くタイルを外します。これには **アクセシビリティの許可** が要ります。許可がないと Dock を再起動する方法に切り替わり、起動中のほかの動くタイルが分かれることがあります。
-- Dock に置くとき、ほかの動くタイルが起動中なら、Dock を再起動せずに置きます。このときタイルは Dock が次に再起動するまで右側に出ます。ほかに起動中の動くタイルがなければ、Dock を再起動して正しい位置に置きます。
-- オフにするとき、本物を元の位置に戻すには Dock の再起動が要ります。ほかの動くタイルが起動中なら再起動せず、本物は Dock に戻しません(警告が出ます)。
-- 本物が起動用アプリを通さずに動いたあと、Dock の右側(最近使ったアプリ)に残る本物のタイルは、自動で消します(DockMorph の常駐中のみ。アクセシビリティの許可が要ります)。ユーザーがピン留めした本物のタイルは消しません。
-- `scripts/bundle.sh` は、キーチェーンに Apple Development の証明書があればそれで署名します(`DOCKMORPH_SIGN_IDENTITY` で指定もできます)。この場合、ビルドし直してもアクセシビリティの許可は残ります。証明書がなければ ad-hoc 署名になり、ビルドし直すたびに許可が外れます。
+- The launcher draws the GIF through a Dock tile plug-in (`NSDockTilePlugIn`).
+- If the real app is not running, the launcher replaces itself with the real app's executable using `execv`. The process is the real app, signed as the real app, and the Dock shows a single tile.
+- Apps whose data folders carry `com.apple.macl` break under `execv`. For these, DockMorph opens the real app separately instead and shows a warning.
+- When the real app is opened directly and the tile splits, DockMorph quits it and reopens it through the launcher (while DockMorph is running).
+- URL schemes of the real app are handled by the launcher and forwarded to it.
+- Antigravity resets its own icon while running. While DockMorph is running, it suppresses this without modifying the app's files or signature. It temporarily uses a local Electron debugging connection and closes it afterward. If port 9229 is in use or an app update disables the connection, DockMorph shows a warning, and **Sync now** retries. Turning the feature off or unregistering the app restores the original behavior.
+- Leftover tiles of the real app in the Dock's recent-apps section are removed automatically (while DockMorph is running). Tiles you pinned yourself are never removed.
 
-## 動作環境
+#### Accessibility permission
 
-- macOS 14 以降
-- Rust(stable)、Xcode(`swiftc`・`codesign`・Metal Toolchain。GUI の gpui のビルドに必要)
+DockMorph operates the Dock tile menus (Options → Remove from Dock / Keep in Dock) to add and remove animated tiles without restarting the Dock. This requires **Accessibility** permission.
 
-## ビルド
+Without it, DockMorph falls back to restarting the Dock. A restart can split the tiles of other running animated apps.
+
+- When placing a tile while another animated app is running, DockMorph does not restart the Dock. The new tile appears on the right side until the Dock next restarts. With no other animated app running, DockMorph restarts the Dock and places the tile in the correct position.
+- When turning the feature off, restoring the real app's original Dock position requires a Dock restart. If another animated app is running, DockMorph skips the restart, leaves the real app out of the Dock, and shows a warning.
+
+## Install
+
+Releases support Apple Silicon only.
+
+### Homebrew
 
 ```sh
-# GUI(DockMorph.app)。出力は target/bundle/DockMorph.app
+brew install --cask narcissus-tazetta/tap/dockmorph
+```
+
+### Manual installation
+
+Download `DockMorph-macos-vX.Y.Z.dmg` from [Releases](https://github.com/Narcissus-tazetta/DockMorph/releases), open it, and move `DockMorph.app` to **Applications**.
+
+### First-launch warning
+
+DockMorph is not notarized, so macOS may block the first launch. After trying to open it, choose **Open Anyway** for DockMorph in **System Settings → Privacy & Security**.
+
+### Updating
+
+Released builds update through [Sparkle](https://sparkle-project.org). On the second launch, DockMorph asks whether to check for updates automatically, and **Check for Updates…** in the menu bar menu checks on demand. Each update's signature is verified before it replaces the app. Homebrew installations can also use `brew upgrade --cask dockmorph`.
+
+Releases are ad-hoc signed, so macOS treats each update as a different app and revokes the Accessibility permission. Grant it again after updating.
+
+## Requirements
+
+- macOS 14 or later (the minimum version set in the app bundle; only macOS 27.2 on Apple Silicon has been tested)
+- Rust (stable) and Xcode, which provides `swiftc`, `codesign`, and the Metal Toolchain that gpui needs
+
+## Build and run
+
+DockMorph is distributed as source only. There are no prebuilt releases.
+
+```sh
+git clone https://github.com/Narcissus-tazetta/DockMorph.git
+cd DockMorph
+
+# GUI. Output: target/bundle/DockMorph.app
 scripts/bundle.sh release
 
-# CLI(target/release/dockmorph)
+# CLI. Output: target/release/dockmorph
 cargo build --release
 ```
 
-`scripts/bundle.sh` はアプリ本体と起動用アプリの雛形だけをビルドします。CLI を使うときは `cargo build --release` も実行してください。
+`scripts/bundle.sh` builds only the app and the launcher template, so run `cargo build --release` as well when you use the CLI.
+
+`scripts/bundle.sh` signs with an Apple Development certificate from your keychain when one is available; set `DOCKMORPH_SIGN_IDENTITY` to choose one. Accessibility permission then survives rebuilds. Without a certificate, the app is signed ad hoc and macOS revokes the permission on every rebuild.
 
 ## CLI
 
 ```
-dockmorph add [--clone] <App.app> <image>   アイコンを付ける
-dockmorph list                              登録と状態を表示
-dockmorph sync                              元アプリの更新を検知して付け直す
-dockmorph set-image <bundle-id> <image>     画像を差し替える
+dockmorph add [--clone] <App.app> <image>   Attach an icon
+dockmorph list                              Show registrations and their state
+dockmorph sync                              Detect app updates and reapply icons
+dockmorph set-image <bundle-id> <image>     Replace the image
 dockmorph animate <bundle-id> on <Launcher.app> [--no-pin]
-dockmorph animate <bundle-id> off           Dock で動かす(実験的)
-dockmorph rejoin <bundle-id>                分かれたタイルを 1 つに戻す
-dockmorph upgrade-launchers <Launcher.app>  起動用アプリを新しい雛形に入れ替える
-dockmorph clear-leftovers                   Dock に残った本物のタイル(起動していないもの)を消す
-dockmorph refresh-dock                      Dock のアイコンキャッシュを消して再起動する
-dockmorph launch <bundle-id>                起動
-dockmorph remove <bundle-id>                アイコンを戻して登録を削除
+dockmorph animate <bundle-id> off           Animated Dock tile (experimental)
+dockmorph rejoin <bundle-id>                Merge a split tile back into one
+dockmorph upgrade-launchers <Launcher.app>  Update launchers to the current template
+dockmorph clear-leftovers                   Remove leftover real-app tiles that are not running
+dockmorph refresh-dock                      Clear the Dock icon cache and restart the Dock
+dockmorph launch <bundle-id>                Launch the app
+dockmorph remove <bundle-id>                Restore the icon and unregister the app
 ```
 
-`Launcher.app` は `DockMorph.app/Contents/Resources/Launcher.app` にある雛形です。
+`Launcher.app` is the template at `DockMorph.app/Contents/Resources/Launcher.app`.
 
-## データの場所
+## Data location
 
-`~/Library/Application Support/DockMorph/` に登録(`entries.json`)・画像・Dock 設定のバックアップを置きます。環境変数 `DOCKMORPH_HOME` で変更できます。
+Registrations (`entries.json`), images, and Dock settings backups live in `~/Library/Application Support/DockMorph/`. Set the `DOCKMORPH_HOME` environment variable to change the location.
 
-## 構成
+## Repository layout
 
-- `crates/core`: 登録・アイコンの付け外し・Dock の操作(`dockmorph-core`)
-- `crates/cli`: CLI
-- `crates/app`: GUI(gpui)。`launcher/` は起動用アプリの雛形(Swift)
-- `scripts/`: バンドル作成とアプリアイコンの生成
+- `crates/core`: registrations, icon attach/detach, and Dock operations (`dockmorph-core`)
+- `crates/cli`: the CLI
+- `crates/app`: the GUI (gpui). `launcher/` holds the launcher app template (Swift)
+- `scripts/`: bundle creation and app icon generation
+
+## License
+
+[MIT](LICENSE)

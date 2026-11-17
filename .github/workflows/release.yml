@@ -1,0 +1,77 @@
+name: release
+
+on:
+    workflow_dispatch:
+        inputs:
+            version:
+                description: X.Y.Z (release-notes/vX.Y.Z.md が要る)
+                required: true
+                type: string
+
+permissions:
+    contents: write
+
+jobs:
+    build-and-publish:
+        runs-on: macos-26
+        steps:
+            - uses: actions/checkout@v4.4.0
+              with:
+                  fetch-depth: 0
+
+            - name: Check release notes
+              run: |
+                  bash scripts/derive_build_number.sh "${{ inputs.version }}" >/dev/null
+                  test -s "release-notes/v${{ inputs.version }}.md" \
+                    || { echo "release-notes/v${{ inputs.version }}.md がない" >&2; exit 1; }
+
+            - name: Select Xcode
+              run: |
+                  sudo xcode-select -s /Applications/Xcode_26.5.app
+                  xcodebuild -version
+                  swift --version
+
+            # gpui は Metal シェーダーをビルド時にコンパイルするので Metal Toolchain が要る
+            - name: Install Metal Toolchain
+              run: xcodebuild -downloadComponent MetalToolchain
+
+            - name: Build zip and dmg
+              run: scripts/package.sh "${{ inputs.version }}"
+
+            - name: Update appcast
+              env:
+                  SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+              run: |
+                  test -n "$SPARKLE_PRIVATE_ED_KEY" || { echo "Missing secret: SPARKLE_PRIVATE_ED_KEY" >&2; exit 1; }
+                  scripts/update-appcast.sh "${{ inputs.version }}"
+
+            - name: Create release
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  gh release create "v${{ inputs.version }}" \
+                    "dist/DockMorph-macos-v${{ inputs.version }}.zip" \
+                    "dist/DockMorph-macos-v${{ inputs.version }}.dmg" \
+                    --title "v${{ inputs.version }}" \
+                    --notes-file "release-notes/v${{ inputs.version }}.md"
+
+            - name: Publish Homebrew cask
+              env:
+                  HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+              run: |
+                  if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+                    echo "::warning title=Homebrew cask skipped::HOMEBREW_TAP_TOKEN is not set, so the cask in the tap was not updated"
+                    echo "### Homebrew cask was skipped (HOMEBREW_TAP_TOKEN is not set)" >> "$GITHUB_STEP_SUMMARY"
+                    exit 0
+                  fi
+                  scripts/publish-homebrew-cask.sh "${{ inputs.version }}"
+
+            # appcast は配布物が公開された後に push する。先に出すと、まだ無い zip を取りに行く更新が走る
+            - name: Commit appcast
+              run: |
+                  git config user.name github-actions
+                  git config user.email github-actions@github.com
+                  git add docs/appcast.xml
+                  git commit -m "chore: update appcast v${{ inputs.version }}"
+                  git pull --rebase origin main
+                  git push origin HEAD:main

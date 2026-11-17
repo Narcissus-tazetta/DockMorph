@@ -7,6 +7,7 @@ mod panel;
 mod store;
 mod theme;
 mod ui;
+mod updater;
 
 use dockmorph_core::DockMorph;
 use futures::StreamExt;
@@ -26,6 +27,7 @@ struct AppState {
     store: Entity<Store>,
     window: Option<WindowHandle<MainView>>,
     menubar: MenuBar,
+    updater: Option<updater::Updater>,
 }
 
 impl Global for AppState {}
@@ -68,7 +70,7 @@ fn open_window(cx: &mut App) {
 
 fn rebuild_menu(cx: &mut App) {
     let state = cx.global::<AppState>();
-    state.menubar.rebuild(state.store.read(cx), login::is_enabled());
+    state.menubar.rebuild(state.store.read(cx), login::is_enabled(), state.updater.is_some());
 }
 
 fn handle(command: Command, cx: &mut App) {
@@ -95,6 +97,12 @@ fn handle(command: Command, cx: &mut App) {
                 open_window(cx);
             }
         }
+        Command::CheckUpdates => {
+            if let Some(updater) = &cx.global::<AppState>().updater {
+                updater.check_for_updates();
+                cx.activate(true);
+            }
+        }
         Command::Quit => cx.quit(),
     }
 }
@@ -107,7 +115,11 @@ fn main() -> anyhow::Result<()> {
         let mtm = MainThreadMarker::new().expect("gpui のコールバックはメインスレッドで呼ばれる");
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let store = cx.new(|cx| Store::new(dm, cx));
-        cx.set_global(AppState { store: store.clone(), window: None, menubar: MenuBar::new(mtm, tx) });
+        let (updater, updater_error) = match updater::Updater::start() {
+            Ok(updater) => (updater, None),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        };
+        cx.set_global(AppState { store: store.clone(), window: None, menubar: MenuBar::new(mtm, tx), updater });
         rebuild_menu(cx);
         cx.observe(&store, |_, cx| rebuild_menu(cx)).detach();
         cx.spawn(async move |cx| {
@@ -150,6 +162,9 @@ fn main() -> anyhow::Result<()> {
         })
         .detach();
 
+        if let Some(detail) = updater_error {
+            store.update(cx, |s, cx| s.notify(Level::Error, "アップデートの確認を使えません", Some(detail), cx));
+        }
         open_window(cx);
     });
     Ok(())

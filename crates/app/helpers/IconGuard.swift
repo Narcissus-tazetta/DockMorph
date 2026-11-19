@@ -7,6 +7,24 @@ struct GuardError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+/// 表示言語。DockMorph の設定(登録ファイルと同じ場所の settings.json)で選ばれた言語、無ければ macOS の言語
+let japanese: Bool = {
+    let args = CommandLine.arguments
+    if args.count > 6 {
+        let settings = URL(fileURLWithPath: args[6]).deletingLastPathComponent().appendingPathComponent("settings.json")
+        do {
+            let object = try JSONSerialization.jsonObject(with: try Data(contentsOf: settings)) as? [String: Any]
+            if let language = object?["language"] as? String { return language == "japanese" }
+        } catch CocoaError.fileReadNoSuchFile {
+        } catch {
+            fputs("Cannot read the DockMorph settings, so the macOS language is used: \(error.localizedDescription)\n", stderr)
+        }
+    }
+    return Locale.preferredLanguages.first?.hasPrefix("ja") ?? false
+}()
+
+func tr(_ ja: String, _ en: String) -> String { japanese ? ja : en }
+
 struct Target {
     let pid: pid_t
     let seconds: UInt64
@@ -47,7 +65,7 @@ final class Inspector {
         let (data, response) = try await session.data(from: discovery)
         guard (response as? HTTPURLResponse)?.statusCode == 200,
               let entries = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            throw GuardError(message: "デバッグ接続先の応答が不正です")
+            throw GuardError(message: tr("デバッグ接続先の応答が不正です", "The debugging endpoint returned an invalid response"))
         }
         return entries
     }
@@ -68,23 +86,31 @@ final class Inspector {
         guard let marker = binary.range(of: sentinel), binary.count > marker.upperBound + 5,
               binary[marker.upperBound] == 1, binary[marker.upperBound + 1] > 3,
               binary[marker.upperBound + 5] == Character("1").asciiValue else {
-            throw GuardError(message: "このバージョンの Antigravity は起動中のアイコン制御に対応していません")
+            throw GuardError(message: tr("このバージョンの Antigravity は起動中のアイコン制御に対応していません", "This version of Antigravity does not support the running-icon control"))
         }
         if !startup {
             // 既存のデバッガを切断しない。自分で開いた待受だけを閉じる。
-            guard try await !available() else { throw GuardError(message: "ポート \(port) が使用中です。既存のデバッグ接続は変更していません") }
-            guard target.isCurrent() else { throw GuardError(message: "対象のアプリは終了または再起動しています") }
-            guard kill(target.pid, SIGUSR1) == 0 else { throw GuardError(message: "対象のアプリへ接続を要求できません (errno \(errno))") }
+            guard try await !available() else { throw GuardError(message: tr("ポート \(port) が使用中です。既存のデバッグ接続は変更していません", "Port \(port) is in use. The existing debugging connection was left unchanged")) }
+            guard target.isCurrent() else { throw GuardError(message: tr("対象のアプリは終了または再起動しています", "The app has quit or restarted")) }
+            guard kill(target.pid, SIGUSR1) == 0 else { throw GuardError(message: tr("対象のアプリへ接続を要求できません (errno \(errno))", "Cannot ask the app to open a debugging connection (errno \(errno))")) }
         }
+        // 起動時は、更新直後の初回起動で macOS がアプリを検査している間も待つ(数十秒かかることがある)。
+        // その間にアプリが終了したら待たない
+        let deadline = Date().addingTimeInterval(startup ? 60 : 10)
         var entries: [[String: Any]] = []
-        for _ in 0..<(startup ? 60 : 25) {
+        while true {
             do {
                 entries = try await endpoints()
-            } catch let error as URLError where error.code == .cannotConnectToHost {
+                break
+            } catch let error as URLError where error.code == .cannotConnectToHost || error.code == .timedOut {
+                guard target.isCurrent(startup: startup) else { throw GuardError(message: tr("対象のアプリは終了または再起動しています", "The app has quit or restarted")) }
+                guard Date() < deadline else {
+                    throw GuardError(message: startup
+                        ? tr("Antigravity のデバッグ接続が 60 秒たっても開きません", "Antigravity's debugging connection did not open within 60 seconds")
+                        : tr("Antigravity のデバッグ接続が開きません。あとから開いた場合に備え、Antigravity を再起動してください", "Antigravity's debugging connection did not open. Restart Antigravity in case it opens later"))
+                }
                 try await Task.sleep(nanoseconds: 100_000_000)
-                continue
             }
-            break
         }
         // 起動時に作った inspector は再接続時にもタイトルに PID を含まないため、待受ソケットの所有者で照合する。
         let owner = Process()
@@ -96,16 +122,18 @@ final class Inspector {
         let data = output.fileHandleForReading.readDataToEndOfFile()
         owner.waitUntilExit()
         guard owner.terminationStatus == 0, String(decoding: data, as: UTF8.self).split(separator: "\n").contains(Substring("p\(target.pid)")) else {
-            throw GuardError(message: "デバッグポートを対象アプリが使用していません")
+            throw GuardError(message: tr("デバッグポートを対象アプリが使用していません", "The debugging port is not used by the app"))
         }
         guard let entry = entries.first,
               let address = entry["webSocketDebuggerUrl"] as? String, let url = URL(string: address),
               url.scheme == "ws", url.host == "127.0.0.1", url.port == port, target.isCurrent(startup: startup) else {
-            throw GuardError(message: "対象アプリのデバッグ接続が開きません。アプリの更新で接続が無効になった可能性があります")
+            throw GuardError(message: tr("対象アプリのデバッグ接続が開きません。アプリの更新で接続が無効になった可能性があります", "Cannot open the app's debugging connection. An app update may have disabled it"))
         }
         socket = session.webSocketTask(with: url)
         socket!.resume()
     }
+
+    var connected: Bool { socket != nil }
 
     func command(_ method: String) async throws {
         _ = try await request(method, params: [:])
@@ -122,13 +150,13 @@ final class Inspector {
             switch message {
             case .string(let text): data = Data(text.utf8)
             case .data(let bytes): data = bytes
-            @unknown default: throw GuardError(message: "デバッグ接続から未知のメッセージを受信しました")
+            @unknown default: throw GuardError(message: tr("デバッグ接続から未知のメッセージを受信しました", "Received an unknown message from the debugging connection"))
             }
-            guard let response = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw GuardError(message: "デバッグ接続の応答が不正です") }
+            guard let response = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw GuardError(message: tr("デバッグ接続の応答が不正です", "Invalid response from the debugging connection")) }
             if response["method"] as? String == "Debugger.paused" { paused = true }
             if response["id"] as? Int != sequence { continue }
             guard response["error"] == nil, let result = response["result"] as? [String: Any] else {
-                throw GuardError(message: "デバッグ接続のコマンドに失敗しました: \(method)")
+                throw GuardError(message: tr("デバッグ接続のコマンドに失敗しました: \(method)", "A debugging command failed: \(method)"))
             }
             return result
         }
@@ -137,7 +165,7 @@ final class Inspector {
     func evaluate(_ expression: String) async throws -> Any {
         let result = try await request("Runtime.evaluate", params: ["expression": expression, "returnByValue": true])
         guard result["exceptionDetails"] == nil, let value = (result["result"] as? [String: Any])?["value"] else {
-            throw GuardError(message: "起動中のアイコン制御に失敗しました。アプリの更新で API が変わった可能性があります")
+            throw GuardError(message: tr("起動中のアイコン制御に失敗しました。アプリの更新で API が変わった可能性があります", "The running-icon control failed. An app update may have changed the API"))
         }
         return value
     }
@@ -161,14 +189,14 @@ final class Inspector {
             _ = try await evaluate("setTimeout(() => process.getBuiltinModule('node:inspector').close(), 250); true")
         } catch {
             socket!.cancel(with: .goingAway, reason: nil)
-            throw GuardError(message: "デバッグ接続を閉じられませんでした。Antigravity を再起動してください")
+            throw GuardError(message: tr("デバッグ接続を閉じられませんでした。Antigravity を再起動してください", "Could not close the debugging connection. Restart Antigravity"))
         }
         socket!.cancel(with: .normalClosure, reason: nil)
         for _ in 0..<20 {
             try await Task.sleep(nanoseconds: 100_000_000)
             if try await !available() { return }
         }
-        throw GuardError(message: "デバッグ接続を閉じられませんでした。Antigravity を再起動してください")
+        throw GuardError(message: tr("デバッグ接続を閉じられませんでした。Antigravity を再起動してください", "Could not close the debugging connection. Restart Antigravity"))
     }
 }
 
@@ -182,28 +210,66 @@ struct Main {
                 Target(pid: pid, seconds: seconds, micros: micros, bundle: URL(fileURLWithPath: args[5]))
             } }
         } : nil
+        // 最後の手段の見張り。起動時は、アプリが --inspect-brk で止まったまま誰も再開させない状態を残さないため、
+        // 時間切れならアプリを終了させる。接続を待つ時間(最大 60 秒)より長くしてある
         let watchdog = DispatchWorkItem {
             if let target = startupTarget, target.isCurrent(startup: true) { kill(target.pid, SIGTERM) }
-            fputs("アイコン制御がタイムアウトしました。Antigravity を再起動してください\n", stderr)
+            fputs(tr("アイコン制御がタイムアウトしました。Antigravity を再起動してください", "The icon control timed out. Restart Antigravity") + "\n", stderr)
             if startup {
-                Task { await showStartupFailure("アイコン制御がタイムアウトしたため、起動を中止しました。"); exit(1) }
+                Task { await showStartupFailure(tr("アイコン制御がタイムアウトしたため、起動を中止しました。", "Startup was stopped because the icon control timed out.")); exit(1) }
             } else { exit(1) }
         }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: watchdog)
+        DispatchQueue.global().asyncAfter(deadline: .now() + (startup ? 90 : 20), execute: watchdog)
+        var inspector: Inspector?
         do {
             guard (startup ? args.count == 8 : (7...8).contains(args.count)), ["apply", "restore", "startup"].contains(args[1]), let pid = Int32(args[2]),
                   let seconds = UInt64(args[3]), let micros = UInt64(args[4]) else {
-                throw GuardError(message: "使い方: DMIconGuard apply|restore pid start-seconds start-micros app-path entries-json")
+                throw GuardError(message: tr("使い方: DMIconGuard apply|restore|startup pid start-seconds start-micros app-path entries-json [port]", "Usage: DMIconGuard apply|restore|startup pid start-seconds start-micros app-path entries-json [port]"))
             }
             let target = Target(pid: pid, seconds: seconds, micros: micros, bundle: URL(fileURLWithPath: args[5]))
             if args[1] == "restore", !target.isCurrent() { return }
             let port = args.count == 8 ? Int(args[7]) : 9229
-            guard let port, (1...65535).contains(port) else { throw GuardError(message: "デバッグ接続のポートが不正です") }
-            let inspector = Inspector(port: port)
-            try await inspector.connect(to: target, startup: startup)
-            if startup { try await inspector.pauseAtEntry() }
+            guard let port, (1...65535).contains(port) else { throw GuardError(message: tr("デバッグ接続のポートが不正です", "Invalid debugging port")) }
+            let connection = Inspector(port: port)
+            inspector = connection
+            try await connection.connect(to: target, startup: startup)
+            if startup { try await connection.pauseAtEntry() }
             let registry = String(decoding: try JSONSerialization.data(withJSONObject: args[6], options: .fragmentsAllowed), as: UTF8.self)
-            let expression = """
+            let expression = guardExpression(pid: pid, registry: registry, restore: args[1] == "restore")
+            _ = try await connection.evaluate(expression)
+            if startup { try await connection.command("Debugger.resume") }
+            try await connection.close()
+            watchdog.cancel()
+            print("\(args[1]) \(pid): ok")
+        } catch {
+            // つないだあとの失敗なら、制御をあきらめてアプリはそのまま動かし、接続を閉じる。
+            // DockMorph の常駐中は、起動後の制御(apply)でもう一度試して、失敗を画面に出す
+            if let connection = inspector, connection.connected {
+                var cleanup: [String] = []
+                if startup {
+                    do { try await connection.command("Debugger.resume") } catch {
+                        cleanup.append(error.localizedDescription)
+                        // 再開できなければアプリは止まったままになるので、終了させる
+                        if let target = startupTarget, target.isCurrent(startup: true) { kill(target.pid, SIGTERM) }
+                    }
+                }
+                do { try await connection.close() } catch { cleanup.append(error.localizedDescription) }
+                watchdog.cancel()
+                fputs(([error.localizedDescription] + cleanup).joined(separator: "\n") + "\n", stderr)
+                if startup && !cleanup.isEmpty { await showStartupFailure(([error.localizedDescription] + cleanup).joined(separator: "\n")) }
+                exit(1)
+            }
+            watchdog.cancel()
+            // つなぐ前の失敗。起動時のアプリは --inspect-brk で止まったまま動けないので、終了させるしかない
+            if let target = startupTarget, target.isCurrent(startup: true) { kill(target.pid, SIGTERM) }
+            fputs("\(error.localizedDescription)\n", stderr)
+            if startup { await showStartupFailure(error.localizedDescription) }
+            exit(1)
+        }
+    }
+
+    static func guardExpression(pid: Int32, registry: String, restore: Bool) -> String {
+        return """
             (() => {
               if (process.pid !== \(pid)) throw Error('pid mismatch');
               const electron = process.mainModule.require('electron');
@@ -216,7 +282,7 @@ struct Main {
                 const path = process.mainModule.require('node:path');
                 state.original.call(state.dock, electron.nativeImage.createFromPath(path.join(process.resourcesPath, 'app.asar', 'icon.png')));
               };
-              \(args[1] != "restore" ? """
+              \(!restore ? """
               if (!globalThis[key]) {
                 const original = dock.setIcon;
                 const state = { dock, original, calls: 0 };
@@ -262,31 +328,13 @@ struct Main {
               return true;
             })()
             """
-            do {
-                _ = try await inspector.evaluate(expression)
-            } catch {
-                if startup { try await inspector.command("Debugger.resume") }
-                try await inspector.close()
-                throw error
-            }
-            if startup { try await inspector.command("Debugger.resume") }
-            try await inspector.close()
-            watchdog.cancel()
-            print("\(args[1]) \(pid): ok")
-        } catch {
-            watchdog.cancel()
-            if let target = startupTarget, target.isCurrent(startup: true) { kill(target.pid, SIGTERM) }
-            fputs("\(error.localizedDescription)\n", stderr)
-            if startup { await showStartupFailure(error.localizedDescription) }
-            exit(1)
-        }
     }
 
     static func showStartupFailure(_ message: String) async {
         await MainActor.run {
             let alert = NSAlert()
-            alert.messageText = "Antigravity の起動時のアイコン制御に失敗しました"
-            alert.informativeText = message + "\nDockMorph の「Dock で動かす」をオフにすると、通常の方法で起動できます。"
+            alert.messageText = tr("Antigravity の起動時のアイコン制御に失敗しました", "The icon control at Antigravity's startup failed")
+            alert.informativeText = message + tr("\nDockMorph の「Dock で動かす」をオフにすると、通常の方法で起動できます。", "\nTurn off \"Animate in the Dock\" in DockMorph to launch it the usual way.")
             NSApplication.shared.activate(ignoringOtherApps: true)
             alert.runModal()
         }

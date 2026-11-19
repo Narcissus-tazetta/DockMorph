@@ -21,7 +21,8 @@ const USAGE: &str = "usage:
                                     replace existing launcher apps with the new template
   dockmorph refresh-dock            clear the icons the Dock remembers and restart the Dock (apps keep running)
   dockmorph launch <bundle-id>      launch
-  dockmorph remove <bundle-id>      restore the icon and delete the registration";
+  dockmorph remove <bundle-id>      restore the icon and delete the registration
+  dockmorph remove-all              restore every registered app (use before uninstalling)";
 
 fn main() -> Result<()> {
     // Rust は SIGPIPE を無視するので、`list | head` で読み手が先に閉じると println! が panic する。
@@ -125,6 +126,18 @@ fn main() -> Result<()> {
         Some("remove") if args.len() == 2 => {
             if let Some(w) = dm.remove(&args[1])? {
                 eprintln!("warning: {w}");
+            }
+        }
+        Some("remove-all") if args.len() == 1 => {
+            let outcome = dm.remove_all();
+            for w in &outcome.warnings {
+                eprintln!("warning: {w}");
+            }
+            for (name, why) in &outcome.failed {
+                eprintln!("error: {name}: {why}");
+            }
+            if !outcome.failed.is_empty() {
+                bail!("{}", lang::tr("元に戻せなかった登録があります", "Some registrations could not be restored"));
             }
         }
         _ => bail!("{USAGE}"),

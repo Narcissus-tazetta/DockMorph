@@ -16,3 +16,4 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSOpenPanel", "NSSavePanel", "NSPanel", "NSWindow", "block2", "NSApplication", "NSRunningApplication", "NSResponder", "NSImage", "NSMenu", "NSMenuItem", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSCell"] }
 objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSGeometry", "NSError", "NSArray", "NSURL", "NSThread", "NSBundle"] }
 objc2-service-management = { version = "0.3", features = ["SMAppService"] }
+objc2-user-notifications = { version = "0.3", features = ["UNUserNotificationCenter", "UNNotification", "UNNotificationRequest", "UNNotificationContent", "UNNotificationAction", "UNNotificationCategory", "UNNotificationResponse", "UNNotificationSettings", "UNNotificationTrigger", "block2"] }

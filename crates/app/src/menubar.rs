@@ -15,6 +15,10 @@ pub enum Command {
     Open,
     Sync,
     Launch(String),
+    /// 分かれたタイルを 1 つに戻す(メニュー・通知のボタンから)
+    Rejoin(String),
+    /// 通知センターに出せなかった理由
+    NotifyFailed(String),
     ToggleLogin,
     CheckUpdates,
     Quit,
@@ -26,6 +30,7 @@ const TAG_LAUNCH: isize = 3;
 const TAG_LOGIN: isize = 4;
 const TAG_QUIT: isize = 5;
 const TAG_UPDATE: isize = 6;
+const TAG_REJOIN: isize = 7;
 
 define_class!(
     // NSMenuItem の target は弱参照なので、MenuBar がこのオブジェクトを持ち続ける
@@ -43,12 +48,12 @@ define_class!(
                 TAG_LOGIN => Command::ToggleLogin,
                 TAG_UPDATE => Command::CheckUpdates,
                 TAG_QUIT => Command::Quit,
-                TAG_LAUNCH => {
+                TAG_LAUNCH | TAG_REJOIN => {
                     let Some(id) = sender.representedObject().and_then(|o| o.downcast::<NSString>().ok()) else {
                         eprintln!("Menu item has no bundle ID: {}", sender.title());
                         return;
                     };
-                    Command::Launch(id.to_string())
+                    if sender.tag() == TAG_LAUNCH { Command::Launch(id.to_string()) } else { Command::Rejoin(id.to_string()) }
                 }
                 tag => {
                     eprintln!("Unknown menu item: tag={tag}");
@@ -151,6 +156,17 @@ impl MenuBar {
                 ) {
                     image.setSize(NSSize::new(16., 16.));
                     menu_item.setImage(Some(&image));
+                }
+            }
+            // 通知を見逃した・許可していない場合でも、ここから戻せるようにする
+            let split: Vec<_> = store.items.iter().filter(|i| i.split()).collect();
+            if !split.is_empty() {
+                self.separator();
+                for item in split {
+                    let menu_item = self.add(&l!("{} のタイルをまとめ直す", "Rejoin the Tiles of {}", item.name), TAG_REJOIN, "");
+                    let id = NSString::from_str(&item.entry.bundle_id);
+                    unsafe { menu_item.setRepresentedObject(Some(&id as &AnyObject)) };
+                    menu_item.setToolTip(Some(&NSString::from_str(tr("アプリを終了して、起動用アプリから開き直します", "Quits the app and reopens it from the launcher app"))));
                 }
             }
         }

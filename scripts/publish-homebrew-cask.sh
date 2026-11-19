@@ -41,7 +41,8 @@ cask "dockmorph" do
   caveats <<~EOS
     DockMorph is not notarized. If macOS blocks the first launch, open
     System Settings → Privacy & Security and choose "Open Anyway".
-    Before uninstalling, remove your apps from DockMorph to restore their icons.
+    Before uninstalling, choose Settings → Restore Everything and Quit in DockMorph
+    (or run dockmorph remove-all) to restore app icons and the Dock.
   EOS
 end
 RUBY

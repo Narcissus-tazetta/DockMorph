@@ -11,6 +11,23 @@ let targetPath = info["DMTargetApp"] as? String ?? ""
 let targetBundleID = info["DMTargetBundleID"] as? String ?? ""
 let direct = info["DMDirect"] as? Bool ?? false
 
+/// 表示言語。DockMorph の設定で選ばれた言語、無ければ macOS の言語
+let japanese: Bool = {
+    if let registry = info["DMRegistry"] as? String {
+        let settings = URL(fileURLWithPath: registry).deletingLastPathComponent().appendingPathComponent("settings.json")
+        do {
+            let object = try JSONSerialization.jsonObject(with: try Data(contentsOf: settings)) as? [String: Any]
+            if let language = object?["language"] as? String { return language == "japanese" }
+        } catch CocoaError.fileReadNoSuchFile {
+        } catch {
+            NSLog("DockMorph: cannot read the settings, so the macOS language is used: \(error.localizedDescription)")
+        }
+    }
+    return Locale.preferredLanguages.first?.hasPrefix("ja") ?? false
+}()
+
+func tr(_ ja: String, _ en: String) -> String { japanese ? ja : en }
+
 /// LaunchServices に問い合わせると、exec の前にこのプロセスが起動用アプリとして登録されかねないので、プロセス一覧を直接見る
 func isRunning(executable: String) -> Bool {
     let count = proc_listallpids(nil, 0)
@@ -31,7 +48,7 @@ let hold = CommandLine.arguments.contains("--dm-hold")
 
 func startupFailure(_ message: String) -> Never {
     let alert = NSAlert()
-    alert.messageText = "Antigravity を起動できません"
+    alert.messageText = tr("Antigravity を起動できません", "Cannot launch Antigravity")
     alert.informativeText = message
     NSApplication.shared.activate(ignoringOtherApps: true)
     alert.runModal()
@@ -54,12 +71,12 @@ func keepRunningIcon(registry: URL) throws -> Bool {
 
 func startupIconGuardEnabled() -> Bool {
     guard let registry = info["DMRegistry"] as? String else {
-        startupFailure("起動用アプリの設定を読めません。DockMorph を起動して更新してください。")
+        startupFailure(tr("起動用アプリの設定を読めません。DockMorph を起動して更新してください。", "Cannot read the launcher app's settings. Open DockMorph to update it."))
     }
     do {
         return try keepRunningIcon(registry: URL(fileURLWithPath: registry))
     } catch {
-        startupFailure("アイコン制御の設定を読めません: \(error.localizedDescription)")
+        startupFailure(tr("アイコン制御の設定を読めません: \(error.localizedDescription)", "Cannot read the icon control setting: \(error.localizedDescription)"))
     }
 }
 
@@ -80,12 +97,12 @@ func execTarget() {
         let size = Int32(MemoryLayout.size(ofValue: processInfo))
         let read = withUnsafeMutablePointer(to: &processInfo) { proc_pidinfo(getpid(), PROC_PIDTBSDINFO, 0, $0, size) }
         guard read == size, let registry = info["DMRegistry"] as? String else {
-            startupFailure("起動用アプリの設定を読めません。DockMorph を起動して更新してください。")
+            startupFailure(tr("起動用アプリの設定を読めません。DockMorph を起動して更新してください。", "Cannot read the launcher app's settings. Open DockMorph to update it."))
         }
         // 通常の起動後ガード(9229)と競合させず、同時起動する別 PID ともポートを分ける。
         let port = 20000 + Int(getpid()) % 40000
         helper.arguments = ["startup", String(getpid()), String(processInfo.pbi_start_tvsec), String(processInfo.pbi_start_tvusec), targetPath, registry, String(port)]
-        do { try helper.run() } catch { startupFailure("アイコン制御を開始できません: \(error.localizedDescription)") }
+        do { try helper.run() } catch { startupFailure(tr("アイコン制御を開始できません: \(error.localizedDescription)", "Cannot start the icon control: \(error.localizedDescription)")) }
         setenv("DOCKMORPH_ICON_GUARD_PID", String(getpid()), 1)
         iconGuard = helper
         startupArguments = ["--inspect-brk=127.0.0.1:\(port)"]
@@ -99,7 +116,7 @@ func execTarget() {
     unsetenv("DOCKMORPH_ICON_GUARD_PID")
     unsetenv("DOCKMORPH_LAUNCHER_PID")
     // 戻ってきたら失敗。本物を開く通常の経路に回す
-    NSLog("DockMorph: exec に失敗 (\(String(cString: strerror(execError)))): \(exe)")
+    NSLog("DockMorph: exec failed (\(String(cString: strerror(execError)))): \(exe)")
 }
 
 execTarget()
@@ -134,7 +151,7 @@ final class Delegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 if let error {
                     let alert = NSAlert()
-                    alert.messageText = "アプリを開けません"
+                    alert.messageText = tr("アプリを開けません", "Cannot open the app")
                     alert.informativeText = "\(url.path)\n\(error.localizedDescription)"
                     NSApp.activate(ignoringOtherApps: true)
                     alert.runModal()

@@ -3,29 +3,46 @@ import ImageIO
 
 private struct Frames {
     static let maxPixels = 256
+    static let minPixels = 64
+    /// 展開したコマの合計の上限。コマは Dock の補助プロセスの中に持つので、長い GIF でメモリを食い尽くさないようにする
+    static let budgetBytes = 64 * 1024 * 1024
     var images: [NSImage] = []
     var delays: [TimeInterval] = []
 
     init?(url: URL) {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-        // コマは Dock のプロセスの中に展開したまま持つ。大きい GIF をそのまま持つと Dock のメモリを食うので、
-        // タイルの最大表示(拡大時 128pt の 2 倍)を超える分は読み込み時に縮める
+        let count = CGImageSourceGetCount(src)
+        guard count > 0 else { return nil }
+        // タイルの最大表示(拡大時 128pt の 2 倍)を超える分は縮める。コマ数が多くて上限を超えるなら、さらに縮め、
+        // それでも足りなければコマを間引く(間引いたコマの表示時間は前のコマに足して、全体の速さを保つ)
+        let fit = Int((Double(Frames.budgetBytes) / Double(4 * count)).squareRoot())
+        let side = min(Frames.maxPixels, max(Frames.minPixels, fit))
+        let stride = max(1, Int((Double(4 * count * side * side) / Double(Frames.budgetBytes)).rounded(.up)))
         let thumb: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: Frames.maxPixels,
+            kCGImageSourceThumbnailMaxPixelSize: side,
         ]
-        for i in 0..<CGImageSourceGetCount(src) {
-            guard let full = CGImageSourceCreateImageAtIndex(src, i, nil) else { continue }
-            let cg = max(full.width, full.height) > Frames.maxPixels
-                ? (CGImageSourceCreateThumbnailAtIndex(src, i, thumb as CFDictionary) ?? full) : full
-            images.append(NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height)))
+        for i in 0..<count {
             let props = CGImageSourceCopyPropertiesAtIndex(src, i, nil) as? [CFString: Any]
             let gif = props?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
             let d = (gif?[kCGImagePropertyGIFUnclampedDelayTime] as? Double)
                 ?? (gif?[kCGImagePropertyGIFDelayTime] as? Double) ?? 0.1
             // 0 や極端に短い値はブラウザと同じく 0.1 秒に寄せる。Dock の描き直しを詰まらせないため
-            delays.append(d < 0.02 ? 0.1 : d)
+            let delay = d < 0.02 ? 0.1 : d
+            if i % stride != 0 {
+                if !delays.isEmpty { delays[delays.count - 1] += delay }
+                continue
+            }
+            let width = (props?[kCGImagePropertyPixelWidth] as? Int) ?? 0
+            let height = (props?[kCGImagePropertyPixelHeight] as? Int) ?? 0
+            // 大きいコマは元の大きさで展開せず、縮小版を直接作る
+            let cg = max(width, height) > side
+                ? CGImageSourceCreateThumbnailAtIndex(src, i, thumb as CFDictionary)
+                : CGImageSourceCreateImageAtIndex(src, i, nil)
+            guard let cg else { continue }
+            images.append(NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height)))
+            delays.append(delay)
         }
         if images.isEmpty { return nil }
         // 1 コマだけなら描き直す必要がない。差し替えの検知のためにゆっくり回す
@@ -33,7 +50,7 @@ private struct Frames {
     }
 }
 
-/// Dock がピン留めのタイルのために読み込むプラグイン。画像は起動用アプリの Resources/tile-image を読む。
+/// Dock がピン留めのタイルのために読み込むプラグイン。画像は起動用アプリの Info.plist の DMTileImage を読む。
 /// DockMorph が画像を差し替えたら、次の周回で読み直す(Dock の再起動は要らない)
 @objc(DMAnimTilePlugin)
 final class DMAnimTilePlugin: NSObject, NSDockTilePlugIn {
@@ -48,11 +65,15 @@ final class DMAnimTilePlugin: NSObject, NSDockTilePlugIn {
     private var hiddenReasons: Set<String> = []
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
 
-    private var imageURL: URL {
-        Bundle(for: DMAnimTilePlugin.self).bundleURL
-            .deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("Resources/tile-image")
-    }
+    /// 起動用アプリの Info.plist の DMTileImage(DockMorph のデータの場所)。画像を変えても起動用アプリを署名し直さずに済む
+    private lazy var imageURL: URL = {
+        let launcher = Bundle(for: DMAnimTilePlugin.self).bundleURL.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        if let path = Bundle(url: launcher)?.infoDictionary?["DMTileImage"] as? String {
+            return URL(fileURLWithPath: path)
+        }
+        // DMTileImage を書く前に作られた起動用アプリ
+        return launcher.appendingPathComponent("Contents/Resources/tile-image")
+    }()
 
     func setDockTile(_ dockTile: NSDockTile?) {
         generation += 1
@@ -108,7 +129,7 @@ final class DMAnimTilePlugin: NSObject, NSDockTilePlugIn {
         loadedDate = date
         frames = Frames(url: imageURL)
         index = 0
-        if frames == nil { NSLog("DockMorph: タイルの画像を読めません: \(imageURL.path)") }
+        if frames == nil { NSLog("DockMorph: cannot read the tile image: \(imageURL.path)") }
     }
 
     private func step(_ gen: Int) {

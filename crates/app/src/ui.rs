@@ -1,7 +1,7 @@
 use dockmorph_core::{l, lang, tr, DockMorph, Language, Mode, TileState};
 use crate::assets::icon;
 use crate::gif::Gifs;
-use crate::store::{clock, DockJob, Item, Level, Store};
+use crate::store::{clock, BannerAction, DockJob, Item, Level, Store};
 use crate::theme::Theme;
 use crate::{login, updater};
 use crate::{AddApp, CloseWindow, SyncNow};
@@ -227,13 +227,39 @@ impl MainView {
 
     fn add(&mut self, cx: &mut Context<Self>) {
         let (Some(app), Some(image)) = (self.pending_app.clone(), self.pending_image.clone()) else { return };
-        if let Some(id) = self.store.update(cx, |s, cx| s.add(&app, &image, cx)) {
-            self.pending_app = None;
-            self.pending_app_icon = None;
-            self.pending_image = None;
-            self.pane = Pane::Entry(id);
-        }
-        cx.notify();
+        let view = cx.entity().downgrade();
+        self.store.update(cx, |s, cx| {
+            s.add(&app, &image, move |id, cx| {
+                view.update(cx, |this, cx| {
+                    this.pending_app = None;
+                    this.pending_app_icon = None;
+                    this.pending_image = None;
+                    this.pane = Pane::Entry(id);
+                    cx.notify();
+                })
+                .ok();
+            }, cx)
+        });
+    }
+
+    fn confirm_restore_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let answer = window.prompt(
+            PromptLevel::Critical,
+            tr("すべて元に戻して DockMorph を終了しますか?", "Restore everything and quit DockMorph?"),
+            Some(tr(
+                "登録したすべてのアプリを元のアイコンに戻し、Dock の動くタイルと起動用アプリを外して、ログイン項目からも外します。                 そのあと DockMorph.app をゴミ箱に入れれば、アンインストールは完了です。登録と画像はデータの場所に残ります(不要なら消してください)",
+                "This restores the original icons of all registered apps, removes the animated Dock tiles and launcher apps, and removes DockMorph from Login Items.                  Then move DockMorph.app to the Trash to finish uninstalling. Registrations and images stay in the data folder (delete it if you no longer need it)",
+            )),
+            &[PromptButton::ok(tr("元に戻して終了", "Restore and Quit")), PromptButton::cancel(tr("キャンセル", "Cancel"))],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if !matches!(answer.await, Ok(0)) {
+                return;
+            }
+            this.update(cx, |this, cx| this.store.update(cx, |s, cx| s.restore_all(|cx| cx.quit(), cx))).ok();
+        })
+        .detach();
     }
 }
 
@@ -769,11 +795,11 @@ impl MainView {
             let on = a.auto_rejoin;
             let row = setting_row(
                 tile("sync", if on { t.green } else { t.accent }, 28.),
-                tr("直接開かれたら自動でまとめ直す", "Rejoin automatically when opened directly"),
+                tr("直接開かれたら知らせる", "Notify when opened directly"),
                 if on {
-                    tr("本物が直接開かれたら、起動した直後に自動で終了して、起動用アプリから開き直します。このアプリ用のリンク(会議リンクなど)は起動用アプリが受け取るので、そのまま 1 つのタイルで開きます。ファイルから開いた場合は、そのファイルは引き継がれません(DockMorph の常駐中だけ働きます)", "If the real app is opened directly, DockMorph quits it right after launch and reopens it from the launcher app. Links for this app (such as meeting links) are received by the launcher app, so they open in a single tile. If you open it from a file, that file is not carried over (works only while DockMorph is running)")
+                    tr("本物が起動用アプリを通さずに開かれたら(ファイルのダブルクリックやターミナルからの起動など)、通知とこの画面で知らせます。アプリは終了させません。「まとめ直す」を押すと、終了して起動用アプリから開き直します。このアプリ用のリンク(会議リンクなど)は起動用アプリが受け取るので、はじめから 1 つのタイルで開きます(DockMorph の常駐中だけ働きます)", "If the real app is opened without the launcher app (for example by double-clicking a file or from Terminal), DockMorph notifies you here and in Notification Center. It does not quit the app. \"Rejoin\" quits it and reopens it from the launcher app. Links for this app (such as meeting links) are received by the launcher app, so they open in a single tile from the start (works only while DockMorph is running)")
                 } else {
-                    tr("オフです。本物が直接開かれると、動かないタイルが出ます。「まとめ直す」で戻せます", "Off. If the real app is opened directly, a non-animated tile appears. \"Rejoin\" restores it")
+                    tr("オフです。本物が直接開かれても知らせません。分かれたタイルはこの画面とメニューバーの「まとめ直す」で戻せます", "Off. DockMorph does not notify you when the real app is opened directly. \"Rejoin\" in this window or the menu bar restores split tiles")
                 },
                 t,
             );
@@ -982,8 +1008,8 @@ impl MainView {
             plain_row(
                 tr("起動中の Antigravity のアイコンを保持する", "Keep the icon of the running Antigravity"),
                 tr(
-                    "Antigravity が起動中に元のアイコンへ戻すのを抑止します。一時的にローカルのデバッグ接続を使います(Antigravity だけが対象です)",
-                    "Stops Antigravity from switching back to its original icon while it runs. Uses a temporary local debugging connection (Antigravity only)",
+                    "Antigravity が起動中に元のアイコンへ戻すのを抑止します。一時的にローカルのデバッグ接続を使います(Antigravity だけが対象です)。接続を開いている短い間は、同じユーザーのほかのプロセスからも Antigravity に接続できます",
+                    "Stops Antigravity from switching back to its original icon while it runs. Uses a temporary local debugging connection (Antigravity only). While it is briefly open, other processes of the same user can also connect to Antigravity",
                 ),
                 t,
             ),
@@ -1042,6 +1068,17 @@ impl MainView {
             button("reveal-data", tr("Finder で表示", "Reveal in Finder"), Some("folder_open"), Kind::Normal, true, t)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.store.update(cx, |s, cx| s.reveal_data_folder(cx)))),
         );
+        let idle = self.store.read(cx).busy.is_none();
+        let restore_row = with_control(
+            plain_row(
+                tr("すべて元に戻して終了", "Restore Everything and Quit"),
+                tr("アンインストールの前に使います。すべてのアプリのアイコン・Dock の動くタイル・ログイン項目を元に戻してから終了します", "Use this before uninstalling. It restores all app icons, animated Dock tiles, and Login Items, then quits"),
+                t,
+            ),
+            button("restore-all", tr("元に戻して終了…", "Restore and Quit…"), Some("undo"), Kind::Destructive, idle, t).when(idle, |d| {
+                d.on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.confirm_restore_all(window, cx)))
+            }),
+        );
 
         div()
             .flex()
@@ -1051,7 +1088,7 @@ impl MainView {
             .child(section(tr("同期", "Sync"), rows(vec![sync_row, guard_row], t), t))
             .child(section(tr("許可", "Permissions"), rows(vec![ax_row], t), t))
             .child(section(tr("アップデート", "Updates"), rows(update_rows, t), t))
-            .child(section(tr("データ", "Data"), rows(vec![data_row], t), t))
+            .child(section(tr("データ", "Data"), rows(vec![data_row, restore_row], t), t))
             .into_any_element()
     }
 
@@ -1193,7 +1230,21 @@ impl MainView {
                             .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(banner.title.clone()))
                             .children(
                                 banner.detail.clone().map(|d| div().text_size(px(11.)).text_color(t.text2).child(d)),
-                            ),
+                            )
+                            .children(banner.action.clone().map(|action| {
+                                let idle = self.store.read(cx).busy.is_none();
+                                let label = match &action {
+                                    BannerAction::Rejoin(_) => tr("まとめ直す", "Rejoin"),
+                                };
+                                div().pt(px(6.)).child(button("banner-action", label, Some("sync"), Kind::Normal, idle, t).when(idle, |d| {
+                                    d.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        let action = action.clone();
+                                        this.store.update(cx, |s, cx| match action {
+                                            BannerAction::Rejoin(id) => s.rejoin(&id, cx),
+                                        })
+                                    }))
+                                }))
+                            })),
                     )
                     .child(
                         icon_button("banner-close", "close", t)

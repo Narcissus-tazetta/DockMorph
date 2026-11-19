@@ -3,6 +3,7 @@ mod gif;
 mod icon_guard;
 mod login;
 mod menubar;
+mod notify;
 mod panel;
 mod store;
 mod theme;
@@ -100,6 +101,8 @@ fn handle(command: Command, cx: &mut App) {
         Command::Open => open_window(cx),
         Command::Sync => store.update(cx, |s, cx| s.sync(true, cx)),
         Command::Launch(id) => store.update(cx, |s, cx| s.launch(&id, cx)),
+        Command::Rejoin(id) => store.update(cx, |s, cx| s.rejoin(&id, cx)),
+        Command::NotifyFailed(reason) => store.update(cx, |s, cx| s.notification_failed(reason, cx)),
         Command::ToggleLogin => {
             if store.update(cx, |s, cx| s.toggle_login(cx)) {
                 open_window(cx);
@@ -129,7 +132,8 @@ fn main() -> anyhow::Result<()> {
     app.run(move |cx: &mut App| {
         let mtm = MainThreadMarker::new().expect("gpui callbacks run on the main thread");
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let store = cx.new(|cx| Store::new(dm, settings, cx));
+        let notifier = notify::Notifier::start(tx.clone());
+        let store = cx.new(|cx| Store::new(dm, settings, notifier, cx));
         let (updater, updater_error) = match updater::Updater::start() {
             Ok(updater) => (updater, None),
             Err(e) => (None, Some(format!("{e:#}"))),

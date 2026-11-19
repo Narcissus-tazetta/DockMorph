@@ -179,3 +179,31 @@ fn wait_for<T>(limit: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// Dock のタイルの一覧に並んでいる数。一覧がまだ無ければ 0
+pub fn tile_count(dock_pid: u32) -> usize {
+    let dock = unsafe { AXUIElement::new_application(dock_pid as libc::pid_t) };
+    unsafe { dock.set_messaging_timeout(2.0) };
+    children(&dock).into_iter().find(|e| string(e, "AXRole").as_deref() == Some("AXList")).map_or(0, |list| children(&list).len())
+}
+
+/// Dock が画面に出しているアプリのタイル(Finder を除く)のパスを、先頭から順に返す。
+/// 途中の区切りやスペーサーは飛ばし、アプリのタイルが並び終えたところに区切りがあるかどうかも返す。
+/// 置き場所のアプリが消えたタイルなどは URL を持たないので None
+pub fn shown_apps(dock_pid: u32) -> Result<Vec<(Option<std::path::PathBuf>, bool)>> {
+    if !trusted() {
+        bail!("{}", l!("アクセシビリティの許可がありません", "Accessibility permission is not granted"));
+    }
+    let dock = unsafe { AXUIElement::new_application(dock_pid as libc::pid_t) };
+    unsafe { dock.set_messaging_timeout(2.0) };
+    let list = children(&dock).into_iter().find(|e| string(e, "AXRole").as_deref() == Some("AXList")).ok_or_else(|| anyhow!("{}", l!("Dock のタイルの一覧が見つかりません", "The list of Dock tiles was not found")))?;
+    let tiles = children(&list);
+    let app = |t: &AXUIElement| string(t, "AXSubrole").as_deref() == Some("AXApplicationDockItem");
+    Ok(tiles
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, t)| app(t))
+        .map(|(i, t)| (tile_path(t), tiles.get(i + 1).is_none_or(|next| !app(next))))
+        .collect())
+}

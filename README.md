@@ -31,9 +31,9 @@ The Dock freezes a running app's tile image, so the real app's tile cannot be an
 - The launcher draws the GIF through a Dock tile plug-in (`NSDockTilePlugIn`).
 - If the real app is not running, the launcher replaces itself with the real app's executable using `execv`. The process is the real app, signed as the real app, and the Dock shows a single tile.
 - Apps whose data folders carry `com.apple.macl` break under `execv`. For these, DockMorph opens the real app separately instead and shows a warning.
-- When the real app is opened directly and the tile splits, DockMorph quits it and reopens it through the launcher (while DockMorph is running).
+- When the real app is opened without the launcher and the tile splits, DockMorph tells you in Notification Center, its window, and the menu bar menu (while DockMorph is running). It never quits the app on its own, so documents and arguments the app was opened with are not lost. **Rejoin** quits the app and reopens it through the launcher.
 - URL schemes of the real app are handled by the launcher and forwarded to it.
-- Antigravity resets its own icon while running. While DockMorph is running, it suppresses this without modifying the app's files or signature. It temporarily uses a local Electron debugging connection and closes it afterward. If port 9229 is in use or an app update disables the connection, DockMorph shows a warning, and **Sync now** retries. Turning the feature off or unregistering the app restores the original behavior.
+- Antigravity resets its own icon while running. While DockMorph is running, it suppresses this without modifying the app's files or signature. It temporarily uses a local Electron debugging connection and closes it afterward. If port 9229 is in use or an app update disables the connection, DockMorph shows a warning, and **Sync now** retries. Turning the feature off or unregistering the app restores the original behavior. While the connection is briefly open, other processes of the same user can also connect to Antigravity. If that concerns you, turn off **Keep the icon of the running Antigravity** in Settings.
 - Leftover tiles of the real app in the Dock's recent-apps section are removed automatically (while DockMorph is running). Tiles you pinned yourself are never removed.
 
 #### Accessibility permission
@@ -68,6 +68,14 @@ DockMorph is not notarized, so macOS may block the first launch. After trying to
 Released builds update through [Sparkle](https://sparkle-project.org). On the second launch, DockMorph asks whether to check for updates automatically, and **Check for Updates…** in the menu bar menu checks on demand. Each update's signature is verified before it replaces the app. Homebrew installations can also use `brew upgrade --cask dockmorph`.
 
 Releases are ad-hoc signed, so macOS treats each update as a different app and revokes the Accessibility permission. Grant it again after updating.
+
+## Uninstall
+
+1. Choose **Settings → Restore Everything and Quit**. DockMorph restores the original icons of all registered apps, removes the animated Dock tiles and launcher apps, removes itself from Login Items, and then quits (`dockmorph remove-all` on the CLI).
+2. Move `DockMorph.app` to the Trash (or run `brew uninstall --cask dockmorph`).
+3. To delete registrations and images, also delete `~/Library/Application Support/DockMorph/`.
+
+If you delete DockMorph.app without step 1, the custom icons, the launcher apps pinned to the Dock, and the link handlers the launchers took over stay behind. Reinstall DockMorph and do step 1 to clean them up.
 
 ## Requirements
 
@@ -108,6 +116,7 @@ dockmorph clear-leftovers                   Remove leftover real-app tiles that 
 dockmorph refresh-dock                      Clear the Dock icon cache and restart the Dock
 dockmorph launch <bundle-id>                Launch the app
 dockmorph remove <bundle-id>                Restore the icon and unregister the app
+dockmorph remove-all                        Restore every registered app (use before uninstalling)
 ```
 
 `Launcher.app` is the template at `DockMorph.app/Contents/Resources/Launcher.app`.

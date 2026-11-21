@@ -1,0 +1,23 @@
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>DockMorph</title>
+        <item>
+            <title>0.1.0</title>
+            <pubDate>Sat, 21 Nov 2026 16:28:35 +0000</pubDate>
+            <link>https://github.com/Narcissus-tazetta/DockMorph</link>
+            <sparkle:version>100</sparkle:version>
+            <sparkle:shortVersionString>0.1.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description sparkle:format="markdown"><![CDATA[First public release.
+
+- Replace any app's icon with a PNG or GIF, and keep it after app updates.
+- Experimental: animate the Dock tile with a GIF while the app is running.
+
+Apple Silicon only, tested on macOS 27.2. DockMorph is not notarized: on first launch, choose **Open Anyway** in System Settings → Privacy & Security. Accessibility permission has to be granted again after each update.
+]]></description>
+            <enclosure url="https://github.com/Narcissus-tazetta/DockMorph/releases/download/v0.1.0/DockMorph-macos-v0.1.0.zip" length="5057153" type="application/octet-stream" sparkle:edSignature="LUbcepryzEG6HUA32iVjPLhxV5LpsA93W74CkIW4fl1i6s45dTVtL2qhyyOSSXlwzGY7tDeYI9k1ReYEO3Z8AA=="/>
+        </item>
+    </channel>
+</rss>

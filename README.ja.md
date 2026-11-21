@@ -47,17 +47,9 @@ Dock のタイルのメニュー(オプション → Dock から削除 / Dock �
 
 ## インストール
 
-配布は Apple Silicon のみです。
+DockMorph のプレビュー版は Apple Silicon 搭載の Mac 向けです。動作確認環境は **macOS 27.2** です。Dock での GIF アニメーションは実験機能です。
 
-### Homebrew
-
-```sh
-brew install --cask narcissus-tazetta/tap/dockmorph
-```
-
-### 手動でインストール
-
-[Releases](https://github.com/Narcissus-tazetta/DockMorph/releases) から `DockMorph-macos-vX.Y.Z.dmg` をダウンロードして開き、`DockMorph.app` を **アプリケーション** に移します。
+[GitHub Releases](https://github.com/Narcissus-tazetta/DockMorph/releases) から `DockMorph-macos-vX.Y.Z.dmg` をダウンロードして開き、`DockMorph.app` を **アプリケーション** にドラッグします。
 
 ### 初回起動の警告
 
@@ -65,14 +57,14 @@ DockMorph は公証されていないため、初回の起動を macOS が止め
 
 ### アップデート
 
-配布版は [Sparkle](https://sparkle-project.org) で更新します。2 回目の起動で、自動で更新を確認するかどうかを聞きます。メニューバーのメニューの **アップデートを確認…** で、いつでも確認できます。更新は署名を検証してから適用します。Homebrew で入れた場合は `brew upgrade --cask dockmorph` でも更新できます。
+配布版は [Sparkle](https://sparkle-project.org) で更新します。2 回目の起動で、自動で更新を確認するかどうかを聞きます。メニューバーのメニューの **アップデートを確認…** で、いつでも確認できます。更新は署名を検証してから適用します。
 
 配布版は ad-hoc 署名のため、更新のたびに別のアプリとして扱われ、アクセシビリティの許可が外れます。更新後は許可し直してください。
 
 ## アンインストール
 
 1. **設定 → すべて元に戻して終了** を押します。登録したすべてのアプリが元のアイコンに戻り、Dock の動くタイルと起動用アプリが外れ、ログイン項目からも外れてから、DockMorph が終了します(CLI では `dockmorph remove-all`)。
-2. `DockMorph.app` をゴミ箱に入れます(Homebrew の場合は `brew uninstall --cask dockmorph`)。
+2. `DockMorph.app` をゴミ箱に入れます。
 3. 登録と画像を消すなら、`~/Library/Application Support/DockMorph/` も消します。
 
 手順 1 を飛ばして DockMorph.app を消すと、付けたアイコン・Dock にピン留めした起動用アプリ・起動用アプリが受け持ったリンクの既定が残ります。その場合は DockMorph を入れ直して手順 1 を行ってください。
@@ -83,8 +75,6 @@ DockMorph は公証されていないため、初回の起動を macOS が止め
 - Rust(stable)、Xcode(`swiftc`・`codesign`・Metal Toolchain。GUI の gpui のビルドに必要)
 
 ## ビルド
-
-配布はソースのみで、ビルド済みのリリースはありません。
 
 ```sh
 git clone https://github.com/Narcissus-tazetta/DockMorph.git

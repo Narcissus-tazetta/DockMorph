@@ -47,17 +47,9 @@ Without it, DockMorph falls back to restarting the Dock. A restart can split the
 
 ## Install
 
-Releases support Apple Silicon only.
+DockMorph is available as a preview for Apple Silicon Macs. It has been tested on **macOS 27.2**. GIF animation in the Dock is experimental.
 
-### Homebrew
-
-```sh
-brew install --cask narcissus-tazetta/tap/dockmorph
-```
-
-### Manual installation
-
-Download `DockMorph-macos-vX.Y.Z.dmg` from [Releases](https://github.com/Narcissus-tazetta/DockMorph/releases), open it, and move `DockMorph.app` to **Applications**.
+Download `DockMorph-macos-vX.Y.Z.dmg` from [GitHub Releases](https://github.com/Narcissus-tazetta/DockMorph/releases), open it, and drag `DockMorph.app` to **Applications**.
 
 ### First-launch warning
 
@@ -65,14 +57,14 @@ DockMorph is not notarized, so macOS may block the first launch. After trying to
 
 ### Updating
 
-Released builds update through [Sparkle](https://sparkle-project.org). On the second launch, DockMorph asks whether to check for updates automatically, and **Check for Updates…** in the menu bar menu checks on demand. Each update's signature is verified before it replaces the app. Homebrew installations can also use `brew upgrade --cask dockmorph`.
+Released builds update through [Sparkle](https://sparkle-project.org). On the second launch, DockMorph asks whether to check for updates automatically, and **Check for Updates…** in the menu bar menu checks on demand. Each update's signature is verified before it replaces the app.
 
 Releases are ad-hoc signed, so macOS treats each update as a different app and revokes the Accessibility permission. Grant it again after updating.
 
 ## Uninstall
 
 1. Choose **Settings → Restore Everything and Quit**. DockMorph restores the original icons of all registered apps, removes the animated Dock tiles and launcher apps, removes itself from Login Items, and then quits (`dockmorph remove-all` on the CLI).
-2. Move `DockMorph.app` to the Trash (or run `brew uninstall --cask dockmorph`).
+2. Move `DockMorph.app` to the Trash.
 3. To delete registrations and images, also delete `~/Library/Application Support/DockMorph/`.
 
 If you delete DockMorph.app without step 1, the custom icons, the launcher apps pinned to the Dock, and the link handlers the launchers took over stay behind. Reinstall DockMorph and do step 1 to clean them up.
@@ -83,8 +75,6 @@ If you delete DockMorph.app without step 1, the custom icons, the launcher apps 
 - Rust (stable) and Xcode, which provides `swiftc`, `codesign`, and the Metal Toolchain that gpui needs
 
 ## Build and run
-
-DockMorph is distributed as source only. There are no prebuilt releases.
 
 ```sh
 git clone https://github.com/Narcissus-tazetta/DockMorph.git

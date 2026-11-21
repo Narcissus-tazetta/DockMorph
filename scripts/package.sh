@@ -5,6 +5,7 @@ set -euo pipefail
 root=${0:A:h:h}
 cd "$root"
 version=${1:?version required (X.Y.Z)}
+command -v create-dmg >/dev/null || { echo "create-dmg is required (brew install create-dmg)" >&2; exit 1; }
 dist=dist
 zip="$dist/DockMorph-macos-v$version.zip"
 dmg="$dist/DockMorph-macos-v$version.dmg"
@@ -22,8 +23,17 @@ ditto -c -k --sequesterRsrc --keepParent "$app" "$zip"
 
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-cp -R "$app" "$stage/"
-ln -s /Applications "$stage/Applications"
-hdiutil create -volname DockMorph -srcfolder "$stage" -ov -format UDZO "$dmg" > /dev/null
+mkdir "$stage/contents"
+cp -R "$app" "$stage/contents/"
+sips -s format png scripts/assets/dmg-background.tiff --out "$stage/background.png" >/dev/null
+create-dmg \
+  --volname DockMorph \
+  --window-size 600 400 \
+  --background "$stage/background.png" \
+  --icon-size 100 \
+  --icon DockMorph.app 150 200 \
+  --app-drop-link 450 200 \
+  --format UDZO \
+  "$dmg" "$stage/contents"
 
 ls -lh "$zip" "$dmg"

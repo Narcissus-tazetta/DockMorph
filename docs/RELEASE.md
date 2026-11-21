@@ -43,6 +43,8 @@ The build number Sparkle compares is derived from the version (`major * 10000 + 
 
 ## Building locally
 
+Install the DMG packaging tool with `brew install create-dmg`.
+
 ```sh
 scripts/package.sh X.Y.Z                 # dist/DockMorph-macos-vX.Y.Z.{zip,dmg}
 scripts/update-appcast.sh X.Y.Z          # signs with the keychain key and updates docs/appcast.xml

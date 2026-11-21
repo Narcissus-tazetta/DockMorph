@@ -7,7 +7,8 @@ set -euo pipefail
 root=${0:A:h:h}
 cd "$root"
 version=${1:?version required (X.Y.Z)}
-tool="$(scripts/fetch-sparkle.sh)/../../../bin/generate_appcast"
+framework=$(scripts/fetch-sparkle.sh)
+tool="${framework:h}/bin/generate_appcast"
 zip="dist/DockMorph-macos-v$version.zip"
 notes="release-notes/v$version.md"
 appcast=${APPCAST_PATH:-docs/appcast.xml}

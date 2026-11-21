@@ -6,7 +6,7 @@ version=2.10.1
 sha256=1a856d2a9edb8e628de88121d7be04cf0e2167f8641650b78fca00b14244cf27
 root=${0:A:h:h}
 dir="$root/target/sparkle/$version"
-framework="$dir/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+framework="$dir/Sparkle.framework"
 if [[ ! -d $framework ]]; then
   mkdir -p "$dir"
   archive=$(mktemp)
@@ -20,4 +20,5 @@ if [[ ! -d $framework ]]; then
   tar -xJf "$archive" -C "$dir" >&2
   rm -f "$archive"
 fi
+[[ -d $framework ]] || { echo "Sparkle.framework が見つからない: $framework" >&2; exit 1; }
 echo "$framework"

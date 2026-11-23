@@ -82,6 +82,11 @@ final class DMAnimTilePlugin: NSObject, NSDockTilePlugIn {
     private var frames: Frames?
     private var index = 0
     private var loadedDate: Date?
+    /// Dock のウィンドウを最後に見た時刻と結果。画面のウィンドウ一覧を取るのに 1 回 1ms 近くかかるので、毎コマではなく 1 秒おきに調べる
+    private var dockCheckedAt = Date.distantPast
+    private var dockVisible = true
+    /// Dock が再起動すると補助プロセスごと作り直されるので、pid は一度引けば変わらない
+    private lazy var dockPID = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier
     private var generation = 0
     /// 画面に出ていない理由。空でなければコマ送りを止める。Dock はコマごとに display() の結果を複製して縮小版を
     /// 作り直すので(実測)、誰も見ていない間も回し続けると Dock の CPU を使い続ける
@@ -155,12 +160,30 @@ final class DMAnimTilePlugin: NSObject, NSDockTilePlugIn {
         if frames == nil { NSLog("DockMorph: cannot read the tile image: \(imageURL.path)") }
     }
 
+    /// フルスクリーンのアプリを使っている間など、Dock のウィンドウが画面に出ていなければ false。
+    /// フルスクリーン中にポインタで Dock を出したときも、次の確認(最大 1 秒後)で再開する
+    private func isDockOnScreen() -> Bool {
+        let now = Date()
+        guard now.timeIntervalSince(dockCheckedAt) >= 1 else { return dockVisible }
+        dockCheckedAt = now
+        guard let dockPID else { return true }
+        let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[CFString: Any]] ?? []
+        let visible = windows.contains { ($0[kCGWindowOwnerPID] as? Int32) == dockPID }
+        if visible != dockVisible { NSLog("DockMorph: Dock window \(visible ? "shown, resuming" : "hidden, pausing") the tile animation") }
+        dockVisible = visible
+        return visible
+    }
+
     private func step(_ gen: Int) {
         guard gen == generation, hiddenReasons.isEmpty, let tile else { return }
         if index == 0 { reloadIfChanged() }
         guard let frames else {
             // 起動時に画像がまだ読めなくても、後から配置・修復された画像を拾い直す。
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.step(gen) }
+            return
+        }
+        guard isDockOnScreen() else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.step(gen) }
             return
         }
         view.image = frames.images[index]

@@ -1,6 +1,7 @@
 mod assets;
 mod gif;
 mod icon_guard;
+mod instance;
 mod login;
 mod menubar;
 mod notify;
@@ -31,6 +32,7 @@ struct AppState {
     updater: Option<updater::Updater>,
     /// アプリのメニュー(cx.set_menus)を作った言語。変わったら作り直す
     menu_japanese: bool,
+    _open_listener: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2::runtime::NSObjectProtocol>>,
 }
 
 impl Global for AppState {}
@@ -121,6 +123,10 @@ fn handle(command: Command, cx: &mut App) {
 
 fn main() -> anyhow::Result<()> {
     let dm = DockMorph::new()?;
+    let Some(_instance) = dm.try_instance_lock()? else {
+        instance::ask_running_to_open();
+        return Ok(());
+    };
     // 設定が壊れていても起動はする。画面が出てから理由を伝える
     let (settings, settings_error) = match dm.settings() {
         Ok(settings) => (settings, None),
@@ -138,7 +144,15 @@ fn main() -> anyhow::Result<()> {
             Ok(updater) => (updater, None),
             Err(e) => (None, Some(format!("{e:#}"))),
         };
-        cx.set_global(AppState { store: store.clone(), window: None, menubar: MenuBar::new(mtm, tx), updater, menu_japanese: lang::is_japanese() });
+        let open_listener = instance::listen(tx.clone());
+        cx.set_global(AppState {
+            store: store.clone(),
+            window: None,
+            menubar: MenuBar::new(mtm, tx),
+            updater,
+            menu_japanese: lang::is_japanese(),
+            _open_listener: open_listener,
+        });
         rebuild_menu(cx);
         cx.observe(&store, |_, cx| rebuild_menu(cx)).detach();
         cx.spawn(async move |cx| {

@@ -23,6 +23,8 @@ private struct Frames {
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: side,
         ]
+        var lastPixels: Data?
+        var firstPixels: Data?
         for i in 0..<count {
             let props = CGImageSourceCopyPropertiesAtIndex(src, i, nil) as? [CFString: Any]
             let gif = props?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
@@ -41,12 +43,33 @@ private struct Frames {
                 ? CGImageSourceCreateThumbnailAtIndex(src, i, thumb as CFDictionary)
                 : CGImageSourceCreateImageAtIndex(src, i, nil)
             guard let cg else { continue }
+            // 前のコマと同じ絵なら表示時間だけ足す。Dock は display() のたびに縮小版を作り直すので、描き直す回数がそのまま負荷になる
+            let pixels = Frames.pixels(cg)
+            if let pixels, pixels == lastPixels, !delays.isEmpty {
+                delays[delays.count - 1] += delay
+                continue
+            }
+            if images.isEmpty { firstPixels = pixels }
+            lastPixels = pixels
             images.append(NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height)))
             delays.append(delay)
         }
         if images.isEmpty { return nil }
+        // 最後のコマが最初と同じなら、周回の継ぎ目で同じ絵を描き直すことになるので最初のコマにまとめる
+        if images.count > 1, let lastPixels, lastPixels == firstPixels {
+            delays[0] += delays.removeLast()
+            images.removeLast()
+        }
         // 1 コマだけなら描き直す必要がない。差し替えの検知のためにゆっくり回す
         if images.count == 1 { delays = [2] }
+    }
+
+    /// 形式の違うコマは別物として扱う(まとめないだけで、見た目は変わらない)
+    private static func pixels(_ cg: CGImage) -> Data? {
+        guard let data = cg.dataProvider?.data else { return nil }
+        var key = Data("\(cg.width)x\(cg.height) \(cg.bytesPerRow) \(cg.bitsPerPixel) \(cg.bitmapInfo.rawValue) \(cg.alphaInfo.rawValue)".utf8)
+        key.append(data as Data)
+        return key
     }
 }
 

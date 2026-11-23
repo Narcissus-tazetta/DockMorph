@@ -184,6 +184,9 @@ struct AppInfo {
 /// entries.json の読み書きを GUI・CLI・自動同期の間で直列化する。flock はプロセスが落ちれば OS が外すので、残骸で詰まらない
 struct Lock(fs::File);
 
+/// `try_instance_lock` の結果。落とすまで他の GUI を起動させない
+pub struct InstanceLock(#[allow(dead_code)] Lock);
+
 impl Drop for Lock {
     fn drop(&mut self) {
         unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
@@ -253,6 +256,26 @@ impl DockMorph {
             bail!("{}", l!("ロックを取れません: {}", "Cannot take the lock: {}", std::io::Error::last_os_error()));
         }
         Ok(Lock(f))
+    }
+
+    /// GUI を 1 つだけ動かすためのロック。持っている間は他の GUI が取れない(None)。
+    /// 2 つ動くと、2 秒ごとの監視・同期・まとめ直しが重なって同じアプリを二重に開き直しかねない
+    pub fn try_instance_lock(&self) -> Result<Option<InstanceLock>> {
+        fs::create_dir_all(&self.home)?;
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.home.join(".instance-lock"))
+            .with_context(|| l!("ロックファイルを開けません: {}", "Cannot open the lock file: {}", self.home.display()))?;
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(InstanceLock(Lock(f))));
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(None);
+        }
+        bail!("{}", l!("ロックを取れません: {}", "Cannot take the lock: {}", e));
     }
 
     /// 書き込みは一時ファイル + rename で原子的に行うので、読むだけならロックは要らない
